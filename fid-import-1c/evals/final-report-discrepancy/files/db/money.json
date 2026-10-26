@@ -1,0 +1,1 @@
+[{"patient_id": 10, "money": "2000.00", "money_operation_type": "invoice_paid", "payment_type": 1, "invoice_id": 1}, {"patient_id": 11, "money": "2000.00", "money_operation_type": "invoice_paid", "payment_type": 1, "invoice_id": 2}, {"patient_id": 12, "money": "2000.00", "money_operation_type": "invoice_paid", "payment_type": 1, "invoice_id": 3}]

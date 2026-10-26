@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: readiness-corrupted-dump
+expected_outcome: |
+  В readiness.md сказано, что файл выгрузки повреждён (начинается заново посреди файла, не закрыт), грузить его нельзя, нужна новая выгрузка из 1С; загрузка в программу не запускалась.
+context:
+  scaffold_script: place-files.sh

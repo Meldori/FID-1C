@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: final-report-discrepancy
+expected_outcome: |
+  report.md даёт общий итог 12/14, по сущностям: записи 2/3, счета 2/3, остальное полностью; называет счёт Т-002 (2000 в 1С против 1800 в базе) и незагруженную запись 12.05.2026; не утверждает, что всё загружено.
+context:
+  scaffold_script: place-files.sh
