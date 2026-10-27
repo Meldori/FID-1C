@@ -1,2 +1,4 @@
 *-workspace/
 dist/
+__pycache__/
+*.pyc
