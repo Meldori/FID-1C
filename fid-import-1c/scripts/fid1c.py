@@ -10,6 +10,7 @@
     python fid1c.py parse                       разобрать XML по типам (WORK/V8Exch_Data)
     python fid1c.py load --tenant <id>          шаг 2: тестовый тенант с нуля → загрузка → кресла → сверка → итог
     python fid1c.py verify --tenant <id> | --db <база>   шаг 3: сверка и итог (reports/final_<id>.md)
+    python fid1c.py requisites --tenant <id> [--from-1c] [--org <ИНН>] [--dry-run]   реквизиты предприятия
     python fid1c.py chairs --tenant <id> [--count 4]   разложить записи по креслам без наложений
     python fid1c.py backup --tenant <id>        дамп базы тенанта (перед переносом в рабочий)
     python fid1c.py extend --tenant <id> [--date 2222-02-02]   продлить подписку
@@ -73,7 +74,7 @@ def defaults():
         'clinic': None, 'dump': None, 'work': 'work', 'fid': os.environ.get('FID', DEFAULT_FID),
         'php': os.environ.get('FID1C_PHP', 'php'), 'mysqldump': os.environ.get('FID1C_MYSQLDUMP'),
         'test_tenant': None, 'source_tenant': '1', 'protected_tenants': ['1', 'lip'],
-        'timezone': None, 'chairs': None, 'memory': '8G',
+        'timezone': None, 'chairs': None, 'organization': None, 'memory': '8G',
     }
 
 
@@ -568,6 +569,12 @@ def cmd_load(a):
             if name == 'branch' and c.cfg.get('timezone'):
                 bridge_ok(br.call('set-timezone', tenant, c.cfg['timezone'], quiet=True), 'Часовой пояс')
                 say(f"   часовой пояс филиала: {c.cfg['timezone']}")
+        if production:
+            say(f'== Реквизиты предприятия не менял (рабочий тенант). Посмотреть, что изменится: '
+                f'python fid1c.py requisites --tenant {tenant} --from-1c --dry-run')
+        elif not a.no_requisites:
+            say('== Реквизиты предприятия из справочника «Организации»')
+            fill_requisites(c, br, tenant)
         if not a.no_chairs:
             say('== Раскладываю записи по креслам')
             res = br.call('chairs', tenant, *([c.cfg['chairs']] if c.cfg.get('chairs') else []))
@@ -660,6 +667,36 @@ def cmd_backup(a):
     return 0
 
 
+def fill_requisites(c, br, tenant, dry=False, from_1c=True):
+    """Карточка предприятия из 1С + синхронизация настроек программы (app_settings печатаются в счетах)."""
+    args = ['requisites', tenant] + (['--from-1c'] if from_1c else []) + (['--dry-run'] if dry else [])
+    if c.cfg.get('organization'):
+        args += ['--org', c.cfg['organization']]
+    res = br.call(*args, quiet=True)
+    if not res.get('ok'):
+        say('   ' + str(res.get('error')))
+        return res
+    say(f"   организация из 1С: {res.get('organization') or '—'}; изменено реквизитов в настройках: {len(res['changes'])}"
+        + (' (пробный прогон, ничего не записано)' if dry else ''))
+    for ch in res['changes']:
+        say(f"   {ch['key']}: «{ch['old'] or '—'}» → «{ch['new'] or '—'}»")
+    return res
+
+
+def cmd_requisites(a):
+    c = Clinic(a.dir or os.getcwd())
+    c.require()
+    tenant = str(a.tenant)
+    if tenant in [str(t) for t in c.cfg.get('protected_tenants') or []] and not a.dry_run and not a.yes:
+        raise Stop(f'Тенант {tenant} рабочий: запись реквизитов только с --yes (по согласию пользователя). '
+                   'Сначала посмотрите изменения: --dry-run', 4)
+    if a.org:
+        c.cfg['organization'] = a.org
+    with Lock('tenant-' + tenant):
+        res = fill_requisites(c, Bridge(c, f'requisites-{tenant}'), tenant, a.dry_run, a.from_1c)
+    return 0 if res.get('ok') else 1
+
+
 def cmd_chairs(a):
     c = Clinic(a.dir or os.getcwd())
     tenant = str(a.tenant)
@@ -738,6 +775,7 @@ def parser():
     p.add_argument('--adopt', action='store_true', help='разрешить пересоздать тенант, созданный не fid1c')
     p.add_argument('--no-build', action='store_true', help='не пересобирать файлы импорта')
     p.add_argument('--no-chairs', action='store_true', help='не раскладывать записи по креслам')
+    p.add_argument('--no-requisites', action='store_true', help='не заполнять реквизиты предприятия из 1С')
     p.add_argument('--production', action='store_true', help='рабочий тенант: без пересоздания, нужен --backup и --yes')
     p.add_argument('--backup', help='свежий дамп рабочего тенанта (fid1c.py backup)')
     p.add_argument('--yes', action='store_true', help='пользователь явно согласился')
@@ -749,6 +787,12 @@ def parser():
     p = sub.add_parser('backup', help='дамп базы тенанта')
     p.add_argument('--tenant', required=True)
     p.add_argument('--database', help='имя базы, если не tenant<id>')
+    p = sub.add_parser('requisites', help='реквизиты предприятия: карточка → настройки программы (из 1С — с --from-1c)')
+    p.add_argument('--tenant', required=True)
+    p.add_argument('--from-1c', action='store_true', help='сначала заполнить карточку из справочника «Организации»')
+    p.add_argument('--org', help='ИНН или ссылка организации, если в 1С их несколько (по умолчанию головное юрлицо)')
+    p.add_argument('--dry-run', action='store_true', help='только показать, что изменится')
+    p.add_argument('--yes', action='store_true', help='для рабочего тенанта: пользователь согласился')
     p = sub.add_parser('chairs', help='разложить записи по креслам (и задать число кресел)')
     p.add_argument('--tenant', required=True)
     p.add_argument('--count', type=int, help='сколько кресел в филиале из 1С')
@@ -761,7 +805,7 @@ def parser():
 
 
 COMMANDS = {'init': cmd_init, 'doctor': cmd_doctor, 'readiness': cmd_readiness, 'parse': cmd_parse, 'load': cmd_load,
-            'verify': cmd_verify, 'chairs': cmd_chairs, 'backup': cmd_backup, 'extend': cmd_extend, 'status': cmd_status}
+            'verify': cmd_verify, 'requisites': cmd_requisites, 'chairs': cmd_chairs, 'backup': cmd_backup, 'extend': cmd_extend, 'status': cmd_status}
 
 
 def main(argv=None):

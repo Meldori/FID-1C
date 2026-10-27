@@ -193,6 +193,63 @@ class ReconcileTest(Temp):
         self.assertEqual(m['invoices']['count'], [3, 3])
         self.assertEqual(m['invoices']['sum'], [6000.0, 5800.0])
 
+    def write_json(self, path, data):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_foreign_clinic_requisites_in_settings_are_found(self):
+        """Настройки программы остались от другой клиники (как «СОВЕРШЕНСТВО УЛЫБКИ» на счёте ДЕНТАЛ АСК)."""
+        work = os.path.join(self.tmp, 'work', 'V8Exch_Data')
+        shutil.copytree(os.path.join(FINAL, 'work', 'V8Exch_Data'), work)
+        self.write_json(os.path.join(work, 'v8_CatalogObject.Организации.json'), {'v8_CatalogObject.Организации': [
+            {'v8_Ref': 'o1', 'v8_DeletionMark': 'false', 'v8_Description': "ООО 'ТЕСТ'", 'v8_ИНН': '7449156550'}]})
+        db = self.copy_db()
+        self.write_json(os.path.join(db, 'legal_entities.json'), [{'id': 1, 'company_name': "ООО 'ТЕСТ'", 'inn': '7449156550', 'kpp': '', 'ogrn': ''}])
+        self.write_json(os.path.join(db, 'app_settings.json'), [{'name': 'company_name', 'value': 'ООО "ЧУЖАЯ КЛИНИКА"'},
+                                                               {'name': 'inn', 'value': '2635269664'}])
+        _, data = reconcile.run(os.path.join(self.tmp, 'work'), db, os.path.join(self.tmp, 'r.md'))
+        rq = data['totals']['metrics']['requisites']
+        self.assertFalse(rq['ok'])
+        self.assertEqual([c['ok'] for c in rq['checks']], [False, True, False])
+        text = reports.final('t', data)
+        self.assertIn('Реквизиты предприятия', text)
+        self.assertIn('Готово к переносу: нет', text)
+        # исправили настройки — проверка проходит
+        self.write_json(os.path.join(db, 'app_settings.json'), [{'name': 'company_name', 'value': "ООО 'ТЕСТ'"}, {'name': 'inn', 'value': '7449156550'}])
+        _, data = reconcile.run(os.path.join(self.tmp, 'work'), db, os.path.join(self.tmp, 'r.md'))
+        self.assertTrue(data['totals']['metrics']['requisites']['ok'])
+
+    def test_requisites_skipped_when_export_has_no_settings(self):
+        self.assertIsNone(self.metrics(os.path.join(FINAL, 'db'))['totals']['metrics']['requisites'])
+
+    def test_card_number_and_several_cards(self):
+        """У пациента две карты: в программе должна остаться первая по дате (№61, а не последняя №77)."""
+        work = os.path.join(self.tmp, 'work', 'V8Exch_Data')
+        shutil.copytree(os.path.join(FINAL, 'work', 'V8Exch_Data'), work)
+        owner = '00000064-1111-2222-3333-444455556666'  # Зайцева (ref(100))
+        self.write_json(os.path.join(work, 'v8_CatalogObject.МедицинскиеКарты.json'), {'v8_CatalogObject.МедицинскиеКарты': [
+            {'v8_Ref': 'c2', 'v8_DeletionMark': 'false', 'v8_ВладелецКарты': owner, 'v8_КодБезНулей': '77', 'v8_ДатаРегистрации': '2026-03-12T00_00_00'},
+            {'v8_Ref': 'c1', 'v8_DeletionMark': 'false', 'v8_ВладелецКарты': owner, 'v8_КодБезНулей': '61', 'v8_ДатаРегистрации': '2026-03-02T00_00_00'}]})
+        db = self.copy_db()
+        users = json.loads(read(db, 'personal_users.json'))
+        for u in users:
+            if u['import_id'] == owner:
+                u['cart'] = '77'  # как раньше: победила последняя карта в файле
+        self.write_json(os.path.join(db, 'personal_users.json'), users)
+        _, data = reconcile.run(os.path.join(self.tmp, 'work'), db, os.path.join(self.tmp, 'r.md'))
+        pat = {e['name']: e for e in data['entities']}['Пациенты']
+        self.assertIn('номер карты', pat['problems'])
+        self.assertEqual(pat['matched'], 2)
+        cards = data['totals']['metrics']['cards']
+        self.assertEqual(cards['wrong_number'], 1)
+        self.assertEqual(cards['several'][0]['cards'], ['61', '77'])
+        for u in users:
+            if u['import_id'] == owner:
+                u['cart'] = '000061'
+        self.write_json(os.path.join(db, 'personal_users.json'), users)
+        _, data = reconcile.run(os.path.join(self.tmp, 'work'), db, os.path.join(self.tmp, 'r.md'))
+        self.assertEqual(data['totals']['metrics']['cards']['wrong_number'], 0)
+
     def test_appointment_without_chair_and_overlap_are_found(self):
         db = self.copy_db()
         path = os.path.join(db, 'appointments.json')
@@ -344,6 +401,12 @@ class CliTest(Temp):
         self.assertEqual(code, 1)
         self.assertIn('12/14', out)
         self.assertTrue(os.path.exists(os.path.join(self.tmp, 'reports', 'final_export.md')))
+
+    def test_requisites_to_protected_tenant_needs_yes(self):
+        d = self.clinic()
+        code, out = run_cli('requisites', '-C', d, '--tenant', 'lip', '--from-1c')
+        self.assertEqual(code, 4)
+        self.assertIn('--yes', out)
 
     def test_requires_config(self):
         code, out = run_cli('readiness', '-C', self.tmp)

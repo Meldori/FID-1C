@@ -185,10 +185,17 @@ def final(target, rec, state=None, ready=None, chairs=None):
     else:
         lines += [f"- {w}: {CONSEQUENCES.get(w, 'нет в выгрузке')}" for w in ready.get('missing') or []] or ['- ничего']
     lines += ['', '### Не проверено', '- интерфейс программы в браузере (открыть карточку пациента, календарь, счёт)', '']
+    rq = ((rec.get('totals') or {}).get('metrics') or {}).get('requisites')
+    rq_bad = bool(rq) and not rq['ok']
+    if clean and rq_bad:
+        clean = False
     if clean:
         verdict = 'да — можно переносить в рабочую базу (после дампа и по явному согласию)'
     elif unexplained or failed_steps:
         verdict = 'нет — есть необъяснённые расхождения или ошибки загрузки'
+    elif rq_bad:
+        verdict = ('нет — реквизиты предприятия не совпадают с организацией из 1С (в счетах и документах будет чужое название): '
+                   'fid1c.py requisites --tenant <id> --from-1c')
     else:
         verdict = 'да, с оговорками — все расхождения объяснены выше'
     lines += [f'Готово к переносу: {verdict}.', '', '### Комментарий', '',

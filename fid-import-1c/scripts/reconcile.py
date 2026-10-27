@@ -16,6 +16,7 @@
   услуги       — есть, название
   записи       — пациент, врач, начало, конец, статус визита (дубли в самой 1С считаются одной записью)
   счета        — есть, сумма = СуммаДокумента, пациент
+  пациенты     — ещё и номер медкарты (при нескольких картах в 1С в программе должна быть первая по дате)
   оплаты       — каждая оплата (пациент + сумма + вид: наличные или безнал) нашлась среди денежных операций
 Метрики (раздел «Метрики» в отчёте): пациенты, счета, оплаты по видам, записи по месяцам, статусам, врачам,
 расстановка по креслам — каждая цифра «в 1С / в базе».
@@ -133,6 +134,25 @@ class Entity:
         self.problems[kind].append(example)
 
 
+def requisites_metric(orgs, settings, entities):
+    """Карточка предприятия: сходятся ли реквизиты в настройках (app_settings, их печатают в счетах) и в карточке
+    (legal_entities) между собой и с организацией из 1С. None, если в выгрузке базы нет настроек."""
+    if not settings and not entities:
+        return None
+    st = {r['name']: s(r.get('value')) for r in settings}
+    card = entities[0] if entities else {}
+    inns = {s(o.get('v8_ИНН')): s(o.get('v8_ПолноеНаименование') or o.get('v8_Description')) for o in orgs if o.get('v8_DeletionMark') != 'true' and s(o.get('v8_ИНН'))}
+    checks = []
+    if inns:
+        checks.append(('ИНН в настройках программы — организация из 1С', st.get('inn') in inns, f"в базе {st.get('inn') or '—'}, в 1С {', '.join(sorted(inns))}"))
+        checks.append(('ИНН в карточке предприятия — организация из 1С', s(card.get('inn')) in inns, f"в базе {s(card.get('inn')) or '—'}, в 1С {', '.join(sorted(inns))}"))
+    same = all(st.get(k, '') == s(card.get(k)) for k in ('company_name', 'inn', 'kpp', 'ogrn'))
+    checks.append(('Настройки программы и карточка предприятия совпадают', same,
+                   f"в настройках «{st.get('company_name') or '—'}», в карточке «{s(card.get('company_name')) or '—'}»"))
+    return {'checks': [{'name': n, 'ok': ok, 'detail': d} for n, ok, d in checks], 'ok': all(ok for _, ok, _ in checks),
+            'settings_name': st.get('company_name'), 'card_name': s(card.get('company_name'))}
+
+
 def appointment_metrics(expected, db_apps, chairs, inv_doc, pu, to_local):
     """Записи «на своих местах»: по месяцам, статусам, врачам, креслам и пересечениям. Пары «в 1С / в базе»."""
     exp_month, exp_status, exp_doc = collections.Counter(), collections.Counter(), collections.Counter()
@@ -197,6 +217,13 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
     users = {r['import_id']: r for r in db(dbdir, 'users')}
     pat = {r['import_id']: r for r in db(dbdir, 'patients')}
     clients = src.load('CatalogObject.Клиенты' if stom else 'CatalogObject.Контрагенты') or []
+    # номера медкарт: у пациента в программе одно поле; при нескольких картах ждём первую по дате регистрации
+    cards_by_owner = collections.defaultdict(list)
+    for c in sorted(src.load('CatalogObject.МедицинскиеКарты') or [], key=lambda c: s(c.get('v8_ДатаРегистрации'))):
+        if c.get('v8_DeletionMark') == 'true':
+            continue
+        cards_by_owner[c.get('v8_Клиент') or c.get('v8_ВладелецКарты')].append(s(c.get('v8_НомерКарты') or c.get('v8_КодБезНулей')).lstrip('0'))
+    card_wrong = 0
     deleted = {k['v8_Ref'] for k in clients if k.get('v8_DeletionMark') == 'true'}
     e = Entity('Пациенты')
     for k in clients:
@@ -230,6 +257,11 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
         if mails and s((users.get(ref) or {}).get('email')).lower() not in mails:
             ok = False
             e.bad('email', (s(k.get('v8_Description')), mails, (users.get(ref) or {}).get('email')))
+        want = (cards_by_owner.get(ref) or [''])[0]
+        if want and s(r.get('cart')).lstrip('0') != want:
+            ok = False
+            card_wrong += 1
+            e.bad('номер карты', (s(k.get('v8_Description')), f'в 1С №{want}', f"в базе №{s(r.get('cart')) or '—'}"))
         e.matched += ok
     ents.append(e)
 
@@ -392,6 +424,12 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
     with_phone_db = sum(1 for r in pu.values() if r['import_id'] in pat and digits(r.get('phone')))
     ent_p = ents[0]
     app_rows = db(dbdir, 'appointments')
+    many_cards = {o: c for o, c in cards_by_owner.items() if len(c) > 1 and o in pat}
+    metrics['cards'] = {'with_card': [sum(1 for o in cards_by_owner if o in pat), sum(1 for r in pu.values() if r['import_id'] in pat and s(r.get('cart')))],
+                        'wrong_number': card_wrong,
+                        'several': [{'patient': ' '.join(s(pu.get(o, {}).get(k)) for k in ('last_name', 'first_name', 'second_name')).strip() or o,
+                                     'cards': c, 'in_program': s(pu.get(o, {}).get('cart')).lstrip('0')} for o, c in many_cards.items()]}
+    metrics['requisites'] = requisites_metric(src.load('CatalogObject.Организации') or [], db(dbdir, 'app_settings'), db(dbdir, 'legal_entities'))
     metrics['patients'] = {
         'total': [ent_p.expected, ent_p.loaded],
         'with_phone': [with_phone_1c, with_phone_db],
@@ -433,6 +471,16 @@ def metrics_lines(m, full=False):
     for label, key in (('Пациентов всего', 'total'), ('с телефоном', 'with_phone'), ('с записями', 'with_appointments'), ('со счетами', 'with_invoices')):
         a, b = p[key]
         out.append(f'| {label} | {num(a)} | {num(b)} | {mark(a, b)} |')
+    c = m.get('cards')
+    if c:
+        out += ['', '### Медкарты', '', '| | В 1С | В базе | |', '| --- | --- | --- | --- |',
+                f"| Пациентов с номером карты | {num(c['with_card'][0])} | {num(c['with_card'][1])} | {mark(c['with_card'][0], c['with_card'][1])} |",
+                f"| Номер карты не совпал | 0 | {c['wrong_number']} | {'✔' if not c['wrong_number'] else '✘'} |"]
+        if c['several']:
+            out += ['', f"Пациентов с несколькими картами в 1С: {len(c['several'])}. В программе у пациента одно поле «номер карты»: "
+                    'остаётся первая по дате регистрации, остальные номера в программу не попадают.']
+            out += [f"- {x['patient'] if full else 'пациент №' + str(i + 1)}: карты {', '.join('№' + n for n in x['cards'])}, в программе №{x['in_program'] or '—'}"
+                    for i, x in enumerate(c['several'][:20])]
     out += ['', '### Счета и оплаты', '', '| | Штук 1С | Штук база | Сумма 1С, ₽ | Сумма база, ₽ | |', '| --- | --- | --- | --- | --- | --- |']
     out.append(f"| Счета | {num(inv['count'][0])} | {num(inv['count'][1])} | {rub(inv['sum'][0])} | {rub(inv['sum'][1])} | {mark(inv['sum'][0], inv['sum'][1]) if inv['count'][0] == inv['count'][1] else '✘'} |")
     for kind in ('cash', 'noncash', 'other'):
@@ -447,6 +495,10 @@ def metrics_lines(m, full=False):
     debt = inv['sum'][0] - t['sum'][0]
     out.append('')
     out.append(f"Не оплачено по счетам (счета минус оплаты в 1С): {rub(debt)} ₽" + (' — переплата или авансы.' if debt < 0 else '.'))
+    rq = m.get('requisites')
+    if rq:
+        out += ['', '### Реквизиты предприятия', '', '| Проверка | Итог | Подробности |', '| --- | --- | --- |']
+        out += [f"| {x['name']} | {'✔' if x['ok'] else '✘'} | {x['detail']} |" for x in rq['checks']]
     a, b = ap['total']
     out += ['', '### Записи: все ли на своих местах', '', '| | |', '| --- | --- |',
             f'| Записей в 1С (уникальных) / в базе | {num(a)} / {num(b)} {mark(a, b)} |',

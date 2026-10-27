@@ -18,6 +18,9 @@
 //   set-timezone <tenant> <tz>   часовой пояс филиалов из 1С (до загрузки записей)
 //   chairs <tenant>              разложить записи по креслам без наложений и пересобрать расписание врачей
 //   export <tenant|db:база> <out> выгрузить загруженное в JSON для сверки (только чтение)
+//   requisites <tenant> [--from-1c] [--org <ref|ИНН>] [--dry-run]
+//                                реквизиты предприятия: карточка (legal_entities) → настройки (app_settings),
+//                                с --from-1c карточка сначала заполняется из справочника «Организации» выгрузки
 
 $fid = rtrim(str_replace('\\', '/', getenv('FID') ?: 'C:/OSPanel/home/Future-IT-Dent'), '/');
 if (!file_exists($fid.'/vendor/autoload.php')) {
@@ -103,6 +106,44 @@ const STEPS = [
     'payment' => ['App\Jobs\Import\I1C\Payment\Payment1C', 'csv', 'get_payment_from_1c'],
     'payment_cart' => ['App\Jobs\Import\I1C\Payment\PaymentCart', 'csv', 'get_payment_cart_from_1c'],
 ];
+
+// Ключи app_settings с реквизитами предприятия ↔ колонки карточки legal_entities. Ключи с паролями и токенами не трогаем.
+const REQUISITES = [
+    'company_name' => 'company_name', 'kpp' => 'kpp', 'inn' => 'inn', 'ogrn' => 'ogrn', 'ur_address' => 'ur_address',
+    'rchet' => 'rchet', 'kor' => 'kor', 'bik' => 'bik', 'okpo' => 'okpo', 'okved' => 'okved', 'phone' => 'phone',
+    'email' => 'email', 'gen_dir' => 'gen_dir',
+];
+
+function one_c_list(string $file): array
+{
+    if (!file_exists($file)) return [];
+    $d = json_decode(file_get_contents($file), true);
+    if (!is_array($d)) return [];
+    $d = array_values($d)[0] ?? [];
+    return isset($d['v8_Ref']) ? [$d] : (is_array($d) ? $d : []);
+}
+
+/** Реквизиты организации из 1С: имя, ИНН, КПП, ОГРН, ОКПО и первые адрес, телефон, email из контактной информации. */
+function org_requisites(array $o): array
+{
+    $text = fn ($v) => is_string($v) ? trim($v) : '';
+    $out = [
+        'company_name' => $text($o['v8_ПолноеНаименование'] ?? '') ?: $text($o['v8_Description'] ?? ''),
+        'inn' => $text($o['v8_ИНН'] ?? ''), 'kpp' => $text($o['v8_КПП'] ?? ''), 'ogrn' => $text($o['v8_ОГРН'] ?? ''),
+        'okpo' => $text($o['v8_КодПоОКПО'] ?? ''),
+    ];
+    // в выгрузке 1С кавычки названия бывают одинарными: 'ДЕНТАЛ АСК' → «ДЕНТАЛ АСК» не угадываем, берём как есть
+    $contacts = $o['v8_КонтактнаяИнформация'] ?? [];
+    $contacts = isset($contacts['v8_Тип']) ? [$contacts] : (is_array($contacts) ? $contacts : []);
+    foreach ($contacts as $c) {
+        $type = $text($c['v8_Тип'] ?? '');
+        $view = $text($c['v8_Представление'] ?? '');
+        if ($type === 'Телефон' && empty($out['phone'])) $out['phone'] = $text($c['v8_НомерТелефона'] ?? '') ?: $view;
+        if ($type === 'АдресЭлектроннойПочты' && empty($out['email'])) $out['email'] = $text($c['v8_АдресЭП'] ?? '') ?: $view;
+        if ($type === 'Адрес' && empty($out['ur_address'])) $out['ur_address'] = $view;
+    }
+    return array_filter($out, fn ($v) => $v !== '');
+}
 
 $cmd = $argv[1] ?? 'help';
 $args = array_slice($argv, 2);
@@ -377,6 +418,49 @@ switch ($cmd) {
             ."без свободного кресла: {$stats['forced']}; блоков расписания: {$stats['timetable_blocks']}\n";
         result(['ok' => true, 'chairs' => count($chairs), 'created' => $created, 'disabled' => $disabled] + $stats + ['by_chair' => $overlaps]);
 
+    case 'requisites':
+        $id = $args[0] ?? fail('requisites <tenant> [--from-1c] [--org <ref|ИНН>] [--dry-run]', 2);
+        $dry = in_array('--dry-run', $args, true);
+        $orgArg = ($i = array_search('--org', $args, true)) !== false ? ($args[$i + 1] ?? null) : null;
+        open_tenant($id);
+        $card = DB::table('legal_entities')->orderBy('id')->first();
+        $picked = null;
+        if (in_array('--from-1c', $args, true)) {
+            $orgs = array_values(array_filter(one_c_list(work().'V8Exch_Data/v8_CatalogObject.Организации.json'),
+                fn ($o) => ($o['v8_DeletionMark'] ?? 'false') !== 'true'));
+            if (!$orgs) fail('В выгрузке нет справочника «Организации» — реквизиты введите вручную', 6);
+            if ($orgArg) {
+                $matched = array_values(array_filter($orgs, fn ($o) => ($o['v8_Ref'] ?? '') === $orgArg || ($o['v8_ИНН'] ?? '') === $orgArg));
+                $picked = $matched[0] ?? fail("Организации $orgArg в выгрузке нет", 2);
+            } else {
+                // головная организация-юрлицо; ИП и филиалы — только если юрлица нет
+                usort($orgs, fn ($a, $b) => [($b['v8_ЮрФизЛицо'] ?? '') === 'ЮрЛицо', ($b['v8_ЭтоГоловнаяОрганизация'] ?? '') === 'true']
+                    <=> [($a['v8_ЮрФизЛицо'] ?? '') === 'ЮрЛицо', ($a['v8_ЭтоГоловнаяОрганизация'] ?? '') === 'true']);
+                $picked = $orgs[0];
+            }
+            $fill = org_requisites($picked);
+            if ($card) {
+                if (!$dry) DB::table('legal_entities')->where('id', $card->id)->update($fill + ['updated_at' => now()]);
+            } elseif (!$dry) {
+                DB::table('legal_entities')->insert($fill + ['entity_type' => 'company', 'created_at' => now(), 'updated_at' => now()]);
+            }
+            $card = $dry ? (object) array_merge((array) ($card ?: []), $fill) : DB::table('legal_entities')->orderBy('id')->first();
+        }
+        if (!$card) fail('Карточка предприятия пуста: используйте --from-1c или заполните её в программе', 6);
+        $changes = [];
+        $current = DB::table('app_settings')->whereIn('name', array_keys(REQUISITES))->pluck('value', 'name')->all();
+        foreach (REQUISITES as $key => $col) {
+            $new = (string) ($card->$col ?? '');
+            $old = (string) ($current[$key] ?? '');
+            if ($new === $old) continue;
+            $changes[] = ['key' => $key, 'old' => $old, 'new' => $new];
+            if (!$dry) {
+                DB::table('app_settings')->updateOrInsert(['name' => $key], ['value' => $new, 'updated_at' => now()]);
+            }
+        }
+        result(['ok' => true, 'tenant' => $id, 'dry_run' => $dry, 'organization' => $picked ? ($picked['v8_ПолноеНаименование'] ?? $picked['v8_Description'] ?? null) : null,
+            'changes' => $changes, 'card_name' => $card->company_name ?? null]);
+
     case 'export':
         [$target, $out] = [$args[0] ?? fail('export <tenant|db:база> <out>', 2), rtrim($args[1] ?? fail('export <tenant|db:база> <out>', 2), '/\\')];
         if (str_starts_with($target, 'db:')) {
@@ -401,6 +485,9 @@ switch ($cmd) {
         $save('money', $db->table('money_operations')->whereIn('patient_id', $patientIds)->get());
         $save('chairs', $db->table('chairs')->get());
         $save('branches', $db->table('branches')->get());
+        $save('legal_entities', $db->table('legal_entities')->get());
+        // в настройках только реквизиты предприятия: рядом лежат пароли и токены интеграций, их не выгружаем
+        $save('app_settings', $db->table('app_settings')->whereIn('name', array_keys(REQUISITES))->get(['name', 'value']));
         $save('family_user', $db->table('family_user')->get());
         echo "Выгружено в $out\n";
         result(['ok' => true, 'out' => $out, 'patients' => count($patientIds)]);

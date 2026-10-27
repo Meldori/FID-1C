@@ -108,7 +108,7 @@ tools/                      make_fixtures.py, build.py, install.py
 ## Тесты
 
 ```bash
-python -m unittest discover -s tests          # скрипты: 41 тест, без PHP и базы
+python -m unittest discover -s tests          # скрипты: 45 тестов, без PHP и базы
 python tools/make_fixtures.py                 # пересобрать выдуманные выгрузки
 claude plugin eval fid-import-1c --allow-tools Write,Edit,Bash --scaffold   # поведение ассистента
 ```
