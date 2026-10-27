@@ -48,7 +48,7 @@ def money(x):
     return f'{x:,.2f}'.replace(',', ' ')
 
 
-def readiness(clinic, check, info, fid=None, cfg=None):
+def readiness(clinic, check, info, fid=None, cfg=None, dump_date=None):
     """check — check_dump.check(), info — scan_1c.analyze(), fid — `fid_bridge info` или None."""
     cfg = cfg or {}
     level, reason = info['level'], info['reason']
@@ -69,7 +69,8 @@ def readiness(clinic, check, info, fid=None, cfg=None):
             parts.append('не закрыт тегом </V8Exch:_1CV8DtUD> — выгрузка оборвана')
         lines.append('Файл: ПОВРЕЖДЁН — ' + '; '.join(parts) + '.')
     period = f"{info['period'][0]} — {info['period'][1]}" if info.get('period') else 'документов нет'
-    lines += [f"Конфигурация: {info['config_label']}", f'Период данных: {period}', '',
+    lines += [f"Конфигурация: {info['config_label']}", f'Период данных: {period}',
+              f'Выгрузка сделана: {dump_date}' if dump_date else 'Дата выгрузки: неизвестна', '',
               '| Что | Есть в 1С | Сколько | Помечено на удаление |', '| --- | --- | --- | --- |']
     for r in info['rows']:
         if r['count'] is None:
@@ -126,7 +127,7 @@ def readiness(clinic, check, info, fid=None, cfg=None):
     return '\n'.join(lines)
 
 
-def final(target, rec, state=None, ready=None, chairs=None):
+def final(target, rec, state=None, ready=None, chairs=None, dump_date=None):
     """rec — reconcile.as_json(); state — шаги загрузки из fid1c_state.json; ready — readiness.json."""
     m, n = rec['score']
     pct = int(1000 * m / n) / 10 if n else 100.0
@@ -140,7 +141,8 @@ def final(target, rec, state=None, ready=None, chairs=None):
         phrase = 'Сверка сошлась, но на загрузке были ошибки — посмотреть шаги ниже.'
     else:
         phrase = f'Перенесено не всё: не совпало {fmt(n - m)} из {fmt(n)}.'
-    lines = [f'## Итог: {fmt(m)}/{fmt(n)} ({pct:.1f}%)', '', f'Куда загружено: {target}', '', phrase, '',
+    source = f'Выгрузка 1С от {dump_date}: изменения в 1С после этой даты в отчёт не попадают.' if dump_date else 'Дата выгрузки 1С не записана (init).'
+    lines = [f'## Итог: {fmt(m)}/{fmt(n)} ({pct:.1f}%)', '', f'Куда загружено: {target}', source, '', phrase, '',
              '| Сущность | В 1С | Загружено | Совпало |', '| --- | --- | --- | --- |']
     for e in rec['entities']:
         mark = '' if e['matched'] == e['expected'] else ' ⚠'
@@ -184,7 +186,18 @@ def final(target, rec, state=None, ready=None, chairs=None):
         lines.append('- не проверялось (нет reports/readiness.json — запустите fid1c.py readiness)')
     else:
         lines += [f"- {w}: {CONSEQUENCES.get(w, 'нет в выгрузке')}" for w in ready.get('missing') or []] or ['- ничего']
-    lines += ['', '### Не проверено', '- интерфейс программы в браузере (открыть карточку пациента, календарь, счёт)', '']
+    metrics = (rec.get('totals') or {}).get('metrics') or {}
+    checked = ['пациенты: ФИО, дата рождения, телефон, email, номер медкарты, номер паспорта',
+               'сотрудники и услуги: ФИО и название', 'записи: пациент, врач, время, статус, кресло',
+               'счета: сумма и пациент; оплаты: сумма, пациент и вид (наличные или безнал)']
+    checked.append('реквизиты предприятия: ИНН и название в настройках, в карточке и в 1С' if metrics.get('requisites')
+                   else 'реквизиты предприятия: НЕ проверялись (в выгрузке базы нет настроек и карточки)')
+    lines += ['', '### Что проверено скриптом'] + [f'- {x}' for x in checked]
+    lines += ['', '### Не проверяется скриптом: посмотреть глазами в программе',
+              '- печатные формы: открыть любой счёт, нажать «Печать»; название и адрес должны быть клиники',
+              '- карточка пациента, календарь и касса в интерфейсе',
+              '- поля, которых нет в сверке: адрес по прописке, комментарии, файлы и снимки',
+              '- что изменилось в 1С после даты выгрузки', '']
     rq = ((rec.get('totals') or {}).get('metrics') or {}).get('requisites')
     rq_bad = bool(rq) and not rq['ok']
     if clean and rq_bad:

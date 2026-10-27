@@ -16,7 +16,7 @@
   услуги       — есть, название
   записи       — пациент, врач, начало, конец, статус визита (дубли в самой 1С считаются одной записью)
   счета        — есть, сумма = СуммаДокумента, пациент
-  пациенты     — ещё и номер медкарты (при нескольких картах в 1С в программе должна быть первая по дате)
+  пациенты     — ещё и номер паспорта (из шага паспортов) и номер медкарты (при нескольких картах в 1С в программе должна быть первая по дате)
   оплаты       — каждая оплата (пациент + сумма + вид: наличные или безнал) нашлась среди денежных операций
 Метрики (раздел «Метрики» в отчёте): пациенты, счета, оплаты по видам, записи по месяцам, статусам, врачам,
 расстановка по креслам — каждая цифра «в 1С / в базе».
@@ -224,6 +224,16 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
             continue
         cards_by_owner[c.get('v8_Клиент') or c.get('v8_ВладелецКарты')].append(s(c.get('v8_НомерКарты') or c.get('v8_КодБезНулей')).lstrip('0'))
     card_wrong = 0
+    # паспорта: отдельный шаг импорта; у пациента в программе один паспорт, при нескольких в 1С остаётся один из них
+    passports = collections.defaultdict(list)
+    pfile = os.path.join(work, 'array_import', 'json', 'patient_passport.json')
+    if os.path.exists(pfile):
+        with open(pfile, encoding='utf-8') as fh:
+            rows = json.load(fh)
+        for row in rows[1:]:
+            rec = dict(zip(rows[0], row))
+            passports[rec.get('ID пациента')].append(re.sub(r'\s+', '', s(rec.get('Паспорт'))))
+    passport_wrong = 0
     deleted = {k['v8_Ref'] for k in clients if k.get('v8_DeletionMark') == 'true'}
     e = Entity('Пациенты')
     for k in clients:
@@ -257,6 +267,12 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
         if mails and s((users.get(ref) or {}).get('email')).lower() not in mails:
             ok = False
             e.bad('email', (s(k.get('v8_Description')), mails, (users.get(ref) or {}).get('email')))
+        if passports.get(ref):
+            got_p = re.sub(r'\s+', '', s(r.get('passport_code')))
+            if got_p not in passports[ref]:
+                ok = False
+                passport_wrong += 1
+                e.bad('паспорт', (s(k.get('v8_Description')), 'в 1С ' + ' / '.join(passports[ref]), f'в базе {got_p or "—"}'))
         want = (cards_by_owner.get(ref) or [''])[0]
         if want and s(r.get('cart')).lstrip('0') != want:
             ok = False
@@ -429,6 +445,9 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
                         'wrong_number': card_wrong,
                         'several': [{'patient': ' '.join(s(pu.get(o, {}).get(k)) for k in ('last_name', 'first_name', 'second_name')).strip() or o,
                                      'cards': c, 'in_program': s(pu.get(o, {}).get('cart')).lstrip('0')} for o, c in many_cards.items()]}
+    several_pass = {o: v for o, v in passports.items() if len(set(v)) > 1 and o in pat}
+    metrics['passports'] = {'with_passport': [sum(1 for o in passports if o in pat), sum(1 for r in pu.values() if r['import_id'] in pat and s(r.get('passport_code')))],
+                            'wrong_number': passport_wrong, 'several': len(several_pass)}
     metrics['requisites'] = requisites_metric(src.load('CatalogObject.Организации') or [], db(dbdir, 'app_settings'), db(dbdir, 'legal_entities'))
     metrics['patients'] = {
         'total': [ent_p.expected, ent_p.loaded],
@@ -471,6 +490,13 @@ def metrics_lines(m, full=False):
     for label, key in (('Пациентов всего', 'total'), ('с телефоном', 'with_phone'), ('с записями', 'with_appointments'), ('со счетами', 'with_invoices')):
         a, b = p[key]
         out.append(f'| {label} | {num(a)} | {num(b)} | {mark(a, b)} |')
+    pp = m.get('passports')
+    if pp:
+        out += ['', '### Паспорта', '', '| | В 1С | В базе | |', '| --- | --- | --- | --- |',
+                f"| Пациентов с паспортом | {num(pp['with_passport'][0])} | {num(pp['with_passport'][1])} | {mark(pp['with_passport'][0], pp['with_passport'][1])} |",
+                f"| Номер паспорта не совпал | 0 | {pp['wrong_number']} | {'✔' if not pp['wrong_number'] else '✘'} |"]
+        if pp['several']:
+            out += ['', f"Пациентов с несколькими паспортами в 1С: {pp['several']}. В программе один паспорт у пациента, остальные не переносятся."]
     c = m.get('cards')
     if c:
         out += ['', '### Медкарты', '', '| | В 1С | В базе | |', '| --- | --- | --- | --- |',

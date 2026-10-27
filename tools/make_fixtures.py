@@ -132,3 +132,41 @@ jw(dbd, 'invoice', [{'id': 1 + i, 'import_id': ref(700 + i), 'patient_id': 10 + 
 jw(dbd, 'chairs', [{'id': 1, 'name': 'Кресло 1', 'branch_id': 1, 'active': 1}])
 jw(dbd, 'money', [{'patient_id': 10 + i, 'money': '2000.00', 'money_operation_type': 'invoice_paid', 'payment_type': 1, 'invoice_id': 1 + i} for i in range(3)])
 print('fixtures written to', os.path.abspath(ROOT))
+
+
+# ---------- 4. Замечания проверяющего: две карты у пациентки, написание фамилии, чужие реквизиты в настройках
+rm = os.path.join(ROOT, 'reviewer-remarks', 'files')
+rw = os.path.join(rm, 'work', 'V8Exch_Data')
+rd = os.path.join(rm, 'work', 'audit_test')
+people_r = [('Аристова', 'Ксения', 'Евгеньевна', 300), ('Поторак', 'Мирон', 'Николаевич', 301), ('Денисенко', 'Тамара', 'Михайловна', 302)]
+jw(rw, 'v8_CatalogObject.Контрагенты', {'v8_CatalogObject.Контрагенты': v8([
+    {'IsFolder': 'false', 'Ref': ref(n), 'DeletionMark': 'false', 'Parent': Z, 'Description': f'{a} {b} {c}', 'Фамилия': a, 'Имя': b,
+     'Отчество': c, 'ТипКонтрагента': 'Клиенты', 'ДатаРожденияКлиента': '2001-01-01T00_00_00'} for a, b, c, n in people_r])})
+jw(rw, 'v8_CatalogObject.МедицинскиеКарты', {'v8_CatalogObject.МедицинскиеКарты': v8([
+    {'Ref': ref(400), 'DeletionMark': 'false', 'Code': '000000000061', 'Description': 'Карта №61, Аристова Ксения Евгеньевна',
+     'ВладелецКарты': ref(300), 'КодБезНулей': '61', 'ДатаРегистрации': '2026-03-02T00_00_00'},
+    {'Ref': ref(401), 'DeletionMark': 'false', 'Code': '000000000077', 'Description': 'Карта №77, Аристова Ксения Евгеньевна',
+     'ВладелецКарты': ref(300), 'КодБезНулей': '77', 'ДатаРегистрации': '2026-03-12T00_00_00'},
+    {'Ref': ref(402), 'DeletionMark': 'false', 'Code': '000000000510', 'Description': 'Карта №510, Поторак Мирон Николаевич',
+     'ВладелецКарты': ref(301), 'КодБезНулей': '510', 'ДатаРегистрации': '2026-03-03T00_00_00'},
+    {'Ref': ref(403), 'DeletionMark': 'false', 'Code': '000000000479', 'Description': 'Карта №479, Денисенко Тамара Михайловна',
+     'ВладелецКарты': ref(302), 'КодБезНулей': '479', 'ДатаРегистрации': '2026-03-04T00_00_00'}])})
+jw(rw, 'v8_CatalogObject.Организации', {'v8_CatalogObject.Организации': v8([
+    {'Ref': ref(500), 'DeletionMark': 'false', 'Description': "ООО 'ДЕНТАЛ АСК'", 'ИНН': '7449156550', 'КПП': '745101001',
+     'ЮрФизЛицо': 'ЮрЛицо', 'ЭтоГоловнаяОрганизация': 'true'}])})
+jw(rd, 'patients', [{'id': 10 + i, 'import_id': ref(n), 'user_id': 20 + i, 'created_at': None} for i, (_, _, _, n) in enumerate(people_r)])
+jw(rd, 'users', [{'id': 20 + i, 'import_id': ref(n), 'email': f'user{20 + i}@user.ru', 'created_at': None} for i, (_, _, _, n) in enumerate(people_r)])
+jw(rd, 'personal_users', [{'import_id': ref(n), 'user_id': 20 + i, 'last_name': a, 'first_name': b, 'second_name': c, 'birthdate': '2001-01-01',
+                           'phone': '', 'cart': {300: '77', 301: '510', 302: '479'}[n]} for i, (a, b, c, n) in enumerate(people_r)])
+jw(rd, 'branches', [{'id': 1, 'name': 'Филиал', 'time_zone': 'Asia/Yekaterinburg', 'import_id': ref(1)}])
+jw(rd, 'legal_entities', [{'id': 1, 'company_name': "ООО 'ДЕНТАЛ АСК'", 'inn': '7449156550', 'kpp': '745101001', 'ogrn': '',
+                           'ur_address': 'г. Челябинск, ул. Цвиллинга, д. 37'}])
+jw(rd, 'app_settings', [{'name': 'company_name', 'value': 'ООО "СОВЕРШЕНСТВО УЛЫБКИ"'}, {'name': 'inn', 'value': '2635269664'},
+                        {'name': 'kpp', 'value': '263501001'}, {'name': 'ogrn', 'value': ''},
+                        {'name': 'ur_address', 'value': 'Ставропольский край, г. Ставрополь, ул. Тухачевского, дом 21, корпус 2'}])
+for name in ('doctors', 'employees', 'services', 'appointments', 'invoice', 'money', 'chairs', 'family_user'):
+    jw(rd, name, [])
+with open(os.path.join(rm, 'fid1c.json'), 'w', encoding='utf-8') as f:
+    json.dump({'clinic': 'Тест', 'dump': 'dump.xml', 'work': 'work', 'fid': 'C:/нет-такого/Future-IT-Dent', 'protected_tenants': ['1', 'lip'],
+               'test_tenant': 'fid1ctest', 'dump_date': '01.10.2026 13:54'}, f, ensure_ascii=False, indent=2)
+print('reviewer-remarks fixtures written')

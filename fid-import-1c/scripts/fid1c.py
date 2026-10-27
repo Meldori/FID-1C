@@ -14,6 +14,7 @@
     python fid1c.py chairs --tenant <id> [--count 4]   разложить записи по креслам без наложений
     python fid1c.py backup --tenant <id>        дамп базы тенанта (перед переносом в рабочий)
     python fid1c.py extend --tenant <id> [--date 2222-02-02]   продлить подписку
+    python fid1c.py find "Поторак" "Полторак"   где встречаются написания: в выгрузке 1С и в базе
     python fid1c.py status                      что уже сделано по этой клинике
 
 Папка клиники (по умолчанию текущая) хранит fid1c.json — настройки, fid1c_state.json — что сделано,
@@ -74,7 +75,7 @@ def defaults():
         'clinic': None, 'dump': None, 'work': 'work', 'fid': os.environ.get('FID', DEFAULT_FID),
         'php': os.environ.get('FID1C_PHP', 'php'), 'mysqldump': os.environ.get('FID1C_MYSQLDUMP'),
         'test_tenant': None, 'source_tenant': '1', 'protected_tenants': ['1', 'lip'],
-        'timezone': None, 'chairs': None, 'organization': None, 'memory': '8G',
+        'timezone': None, 'chairs': None, 'organization': None, 'dump_date': None, 'memory': '8G',
     }
 
 
@@ -275,6 +276,7 @@ def cmd_init(a):
         dump = src
     else:
         raise Stop('Ожидается .xml, .zip, .rar или .7z с выгрузкой 1С', 2)
+    c.cfg['dump_date'] = dump_date_of(src, dump)
     c.cfg['clinic'] = a.clinic or c.cfg.get('clinic') or os.path.splitext(os.path.basename(src))[0]
     # внутри папки клиники путь относительный (папку можно переносить), снаружи — абсолютный
     c.cfg['dump'] = os.path.relpath(dump, root) if os.path.abspath(dump).startswith(root + os.sep) else dump
@@ -289,6 +291,21 @@ def cmd_init(a):
     say(f'Папка клиники: {root}\nВыгрузка: {dump}\nНастройки: {c.path(CONFIG)}')
     say('Дальше: python fid1c.py doctor, затем python fid1c.py readiness')
     return 0
+
+
+def dump_date_of(src, dump):
+    """Когда сделана выгрузка 1С: дата файла в архиве (при распаковке время файла теряется) или дата самого файла."""
+    try:
+        if src.lower().endswith('.zip'):
+            with zipfile.ZipFile(src) as z:
+                xmls = [i for i in z.infolist() if i.filename.lower().endswith('.xml')]
+                if xmls:
+                    y, mo, d, h, mi, _ = max(xmls, key=lambda i: i.file_size).date_time
+                    return f'{d:02d}.{mo:02d}.{y} {h:02d}:{mi:02d}'
+        stamp = os.path.getmtime(dump if src.lower().endswith('.xml') else src)
+        return dt.datetime.fromtimestamp(stamp).strftime('%d.%m.%Y %H:%M')
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return None
 
 
 def safe_members(names, dest):
@@ -417,7 +434,7 @@ def cmd_readiness(a):
             fid = Bridge(c).call('info', quiet=True)
         except Stop:
             fid = None
-    text = reports.readiness(c.cfg.get('clinic') or 'клиники', chk, info, fid, c.cfg)
+    text = reports.readiness(c.cfg.get('clinic') or 'клиники', chk, info, fid, c.cfg, c.cfg.get('dump_date'))
     with open(c.path('reports', 'readiness.md'), 'w', encoding='utf-8') as f:
         f.write(text)
     with open(c.path('reports', 'readiness.json'), 'w', encoding='utf-8') as f:
@@ -613,7 +630,7 @@ def verify(c, br, tenant, dbname, export=None):
         with open(c.path('reports', 'readiness.json'), encoding='utf-8') as f:
             ready = json.load(f)
     where = f'выгрузка {export}' if export else f'база {dbname}' if dbname else f"тенант {tenant} ({tenant}.localhost)" + (' — РАБОЧИЙ' if run.get('production') else ' — тестовый')
-    text = reports.final(where, rec, run.get('steps'), ready, run.get('chairs'))
+    text = reports.final(where, rec, run.get('steps'), ready, run.get('chairs'), c.cfg.get('dump_date'))
     path = c.path('reports', f'final_{label}.md')
     with open(path, 'w', encoding='utf-8') as f:
         f.write(text)
@@ -721,6 +738,58 @@ def cmd_extend(a):
     return 0
 
 
+def unescape(chunk):
+    """Фрагмент JSON, где кириллица записана кодами (слеш, u и четыре цифры), → читаемый текст; обрезанный на краю фрагмент не трогаем."""
+    import re
+    return re.sub(re.escape(chr(92)) + 'u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), chunk)
+
+
+def cmd_find(a):
+    """Поиск текста (без учёта регистра) по разобранной выгрузке 1С и по выгрузкам базы: что где написано.
+
+    Нужна, когда проверяющий присылает «в программе одно, должно быть другое»: за минуту видно, как это
+    написано в 1С, в файлах импорта и в базе, и откуда взялась разница.
+    """
+    c = Clinic(a.dir or os.getcwd())
+    c.require()
+    work = c.work
+    places = [('1С (разобранная выгрузка)', glob.glob(os.path.join(work, 'V8Exch_Data', '*.json'))),
+              ('файлы импорта', glob.glob(os.path.join(work, 'array_import', 'json', '*.json'))),
+              ('база (выгрузка для сверки)', glob.glob(os.path.join(work, 'audit_*', '*.json')))]
+    if not any(files for _, files in places):
+        raise Stop('Нет разобранной выгрузки: сначала fid1c.py parse или load', 2)
+    found_any = False
+    for term in a.terms:
+        low = term.lower()
+        say(f'{chr(10)}«{term}»')
+        total = 0
+        for title, files in places:
+            for path in sorted(files):
+                hits, shown = 0, []
+                with open(path, encoding='utf-8', errors='replace') as fh:
+                    for line in fh:
+                        # файлы разобранной выгрузки хранят кириллицу кодами (слеш, u, четыре цифры): сначала декодируем,
+                        # иначе поиск по «Поторак» их не видит
+                        plain = unescape(line) if chr(92) + 'u' in line else line
+                        text = plain.lower()
+                        pos = text.find(low)
+                        while pos != -1:
+                            hits += 1
+                            if len(shown) < a.examples:
+                                shown.append(plain[max(pos - 40, 0):pos + len(low) + 40].strip())
+                            pos = text.find(low, pos + len(low))
+                if hits:
+                    total += hits
+                    name = os.path.basename(os.path.dirname(path)) + '/' + os.path.basename(path) if title.startswith('база') else os.path.basename(path)
+                    say(f'  {title}: {name} — {hits}')
+                    for ex in shown:
+                        say(f'      …{ex}…')
+        if not total:
+            say('  нигде не встречается')
+        found_any = found_any or bool(total)
+    return 0 if found_any else 1
+
+
 def cmd_status(a):
     c = Clinic(a.dir or os.getcwd())
     c.require()
@@ -800,12 +869,15 @@ def parser():
     p = sub.add_parser('extend', help='продлить подписку тенанта')
     p.add_argument('--tenant', required=True)
     p.add_argument('--date', default='2222-02-02')
+    p = sub.add_parser('find', help='найти написание (фамилию, название) в выгрузке 1С и в базе')
+    p.add_argument('terms', nargs='+')
+    p.add_argument('--examples', type=int, default=2, help='сколько примеров показывать на файл')
     sub.add_parser('status', help='что сделано по клинике')
     return ap
 
 
 COMMANDS = {'init': cmd_init, 'doctor': cmd_doctor, 'readiness': cmd_readiness, 'parse': cmd_parse, 'load': cmd_load,
-            'verify': cmd_verify, 'requisites': cmd_requisites, 'chairs': cmd_chairs, 'backup': cmd_backup, 'extend': cmd_extend, 'status': cmd_status}
+            'verify': cmd_verify, 'find': cmd_find, 'requisites': cmd_requisites, 'chairs': cmd_chairs, 'backup': cmd_backup, 'extend': cmd_extend, 'status': cmd_status}
 
 
 def main(argv=None):

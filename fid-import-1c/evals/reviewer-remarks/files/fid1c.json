@@ -1,0 +1,12 @@
+{
+  "clinic": "Тест",
+  "dump": "dump.xml",
+  "work": "work",
+  "fid": "C:/нет-такого/Future-IT-Dent",
+  "protected_tenants": [
+    "1",
+    "lip"
+  ],
+  "test_tenant": "fid1ctest",
+  "dump_date": "01.10.2026 13:54"
+}

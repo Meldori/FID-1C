@@ -302,6 +302,16 @@ class ReportsTest(unittest.TestCase):
         self.assertNotIn('загрузить пригодную часть', text, 'в пригодной части нет записей и счетов — грузить нечего')
         self.assertIn('после обрыва', text)
 
+    def test_final_report_says_what_was_and_was_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, data = reconcile.run(os.path.join(FINAL, 'work'), os.path.join(FINAL, 'db'), os.path.join(tmp, 'r.md'))
+        text = reports.final('t', data, dump_date='01.10.2026 13:54')
+        self.assertIn('Выгрузка 1С от 01.10.2026 13:54', text)
+        self.assertIn('### Что проверено скриптом', text)
+        self.assertIn('НЕ проверялись', text, 'нет настроек в выгрузке базы — об этом должно быть сказано прямо')
+        self.assertIn('печатные формы', text)
+        self.assertIn('что изменилось в 1С после даты выгрузки', text)
+
     def test_final_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, data = reconcile.run(os.path.join(FINAL, 'work'), os.path.join(FINAL, 'db'), os.path.join(tmp, 'r.md'))
@@ -407,6 +417,32 @@ class CliTest(Temp):
         code, out = run_cli('requisites', '-C', d, '--tenant', 'lip', '--from-1c')
         self.assertEqual(code, 4)
         self.assertIn('--yes', out)
+
+    def test_find_searches_escaped_json_and_db_export(self):
+        d = self.clinic()
+        data = os.path.join(d, 'work', 'V8Exch_Data')
+        os.makedirs(data)
+        with open(os.path.join(data, 'v8_CatalogObject.Контрагенты.json'), 'w', encoding='utf-8') as f:
+            json.dump([{'v8_Description': 'Поторак Мирон Николаевич'}], f)  # ensure_ascii: кириллица кодами \uXXXX
+        audit = os.path.join(d, 'work', 'audit_t')
+        os.makedirs(audit)
+        with open(os.path.join(audit, 'personal_users.json'), 'w', encoding='utf-8') as f:
+            json.dump([{'last_name': 'Поторак'}], f, ensure_ascii=False)
+        code, out = run_cli('find', '-C', d, 'поторак', 'Полторак')
+        self.assertEqual(code, 0)
+        self.assertIn('Поторак Мирон Николаевич', out)
+        self.assertIn('audit_t/personal_users.json', out)
+        self.assertIn('нигде не встречается', out)
+        code, out = run_cli('find', '-C', d, 'Полторак')
+        self.assertEqual(code, 1)
+
+    def test_init_records_dump_date_from_zip(self):
+        z = os.path.join(self.tmp, 'dump.zip')
+        with zipfile.ZipFile(z, 'w') as f:
+            f.write(STOM, 'dump.xml')
+        d = os.path.join(self.tmp, 'c')
+        run_cli('init', z, '--dir', d)
+        self.assertRegex(fid1c.Clinic(d).cfg['dump_date'], r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$')
 
     def test_requires_config(self):
         code, out = run_cli('readiness', '-C', self.tmp)
