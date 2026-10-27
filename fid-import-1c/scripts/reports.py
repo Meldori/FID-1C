@@ -5,6 +5,8 @@
 """
 import datetime as dt
 
+import reconcile
+
 # Что пользователь потеряет в программе, если в выгрузке нет объекта
 CONSEQUENCES = {
     'Филиал': 'филиал создастся без данных из 1С; часовой пояс задать вручную',
@@ -146,7 +148,8 @@ def final(target, rec, state=None, ready=None, chairs=None):
     t = rec['totals']
     lines += ['', f"Деньги: счета {money(t['invoices_sum_1c'])} ₽ в 1С / {money(t['invoices_sum_db'])} ₽ в базе; "
                   f"оплаты {money(t['payments_sum_1c'])} ₽ / {money(t['payments_sum_db'])} ₽.",
-              f"Часовой пояс сверки: {t.get('tz', '?')}.", '']
+              f"Часовой пояс сверки: {t.get('tz', '?')}."]
+    lines += reconcile.metrics_lines(t.get('metrics'))
 
     lines.append('### Расхождения')
     if not problems:

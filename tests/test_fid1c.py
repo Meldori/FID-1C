@@ -148,6 +148,68 @@ class ReconcileTest(Temp):
         self.assertEqual(data['totals']['invoices_sum_1c'], 6000)
         self.assertEqual(data['totals']['invoices_sum_db'], 5800)
 
+    def copy_db(self):
+        dst = os.path.join(self.tmp, 'db')
+        shutil.copytree(os.path.join(FINAL, 'db'), dst)
+        return dst
+
+    def metrics(self, dbdir):
+        _, data = reconcile.run(os.path.join(FINAL, 'work'), dbdir, os.path.join(self.tmp, 'r.md'))
+        return data
+
+    def test_metrics_counts_and_money(self):
+        m = self.metrics(os.path.join(FINAL, 'db'))['totals']['metrics']
+        self.assertEqual(m['patients']['total'], [3, 3])
+        self.assertEqual(m['patients']['with_appointments'], [3, 2])
+        self.assertEqual(m['invoices']['sum'], [6000.0, 5800.0])
+        self.assertEqual(m['payments']['cash']['sum'], [6000.0, 6000.0])
+        self.assertEqual(m['payments']['noncash']['count'], [0, 0])
+        self.assertEqual(m['payments']['total']['count'], [3, 3])
+        ap = m['appointments']
+        self.assertEqual(ap['total'], [3, 2])
+        self.assertEqual((ap['months_mismatch'], ap['status_mismatch'], ap['doctors_mismatch']), (1, 1, 1))
+        self.assertEqual((ap['active_without_chair'], ap['chair_overlaps']), (0, 0))
+
+    def test_wrong_payment_kind_is_a_discrepancy(self):
+        db = self.copy_db()
+        path = os.path.join(db, 'money.json')
+        money = json.loads(read(path))
+        money[0]['payment_type'] = 2  # в 1С наличные, в базе записали как безнал
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(money, f)
+        data = self.metrics(db)
+        pay = {e['name']: e for e in data['entities']}['Оплаты']
+        self.assertEqual((pay['matched'], pay['expected']), (2, 3))
+        self.assertEqual(data['totals']['metrics']['payments']['noncash']['sum'], [0.0, 2000.0])
+
+    def test_demo_invoices_of_tenant_template_are_not_counted(self):
+        db = self.copy_db()
+        path = os.path.join(db, 'invoice.json')
+        invoices = json.loads(read(path))
+        invoices.append({'id': 99, 'import_id': '21725', 'patient_id': 10, 'price': '777.00'})
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(invoices, f)
+        m = self.metrics(db)['totals']['metrics']
+        self.assertEqual(m['invoices']['count'], [3, 3])
+        self.assertEqual(m['invoices']['sum'], [6000.0, 5800.0])
+
+    def test_appointment_without_chair_and_overlap_are_found(self):
+        db = self.copy_db()
+        path = os.path.join(db, 'appointments.json')
+        apps = json.loads(read(path))
+        apps[0]['chair_id'] = 77  # такого кресла нет
+        apps[1]['chair_id'] = 1
+        apps[1]['time_begin'], apps[1]['time_end'] = apps[0]['time_begin'], apps[0]['time_end']
+        apps[0]['chair_id'] = 1
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(apps, f)
+        ap = self.metrics(db)['totals']['metrics']['appointments']
+        self.assertEqual(ap['chair_overlaps'], 1)
+        apps[1]['chair_id'] = 77
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(apps, f)
+        self.assertEqual(self.metrics(db)['totals']['metrics']['appointments']['active_without_chair'], 1)
+
     def test_fixed_offset_and_named_zone_agree_for_today(self):
         import datetime as dt
         fixed, _ = reconcile.local_clock(None, 5)
@@ -190,6 +252,9 @@ class ReportsTest(unittest.TestCase):
         self.assertIn('## Итог: 12/14 (85.7%)', text)
         self.assertIn('Готово к переносу: нет', text)
         self.assertIn('Т-002', text)
+        self.assertIn('## Метрики', text)
+        self.assertIn('Оплаты: наличные', text)
+        self.assertIn('Записи: все ли на своих местах', text)
 
     def test_percent_rounds_down(self):
         data = {'score': [2586, 2587], 'totals': {'invoices_sum_1c': 0, 'invoices_sum_db': 0, 'payments_sum_1c': 0,

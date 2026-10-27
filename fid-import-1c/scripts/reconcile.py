@@ -16,7 +16,9 @@
   услуги       — есть, название
   записи       — пациент, врач, начало, конец, статус визита (дубли в самой 1С считаются одной записью)
   счета        — есть, сумма = СуммаДокумента, пациент
-  оплаты       — каждая оплата (пациент + сумма) нашлась среди денежных операций
+  оплаты       — каждая оплата (пациент + сумма + вид: наличные или безнал) нашлась среди денежных операций
+Метрики (раздел «Метрики» в отчёте): пациенты, счета, оплаты по видам, записи по месяцам, статусам, врачам,
+расстановка по креслам — каждая цифра «в 1С / в базе».
 Код выхода: 0 — всё совпало, 1 — есть расхождения.
 """
 import argparse
@@ -28,6 +30,7 @@ import re
 import sys
 
 ZERO = '00000000-0000-0000-0000-000000000000'
+GUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 TZ = {'Europe/Kaliningrad': 2, 'Europe/Moscow': 3, 'Europe/Samara': 4, 'Europe/Ulyanovsk': 4, 'Europe/Saratov': 4,
       'Europe/Astrakhan': 4, 'Asia/Yekaterinburg': 5, 'Asia/Omsk': 6, 'Asia/Novosibirsk': 7, 'Asia/Barnaul': 7,
       'Asia/Tomsk': 7, 'Asia/Novokuznetsk': 7, 'Asia/Krasnoyarsk': 7, 'Asia/Irkutsk': 8, 'Asia/Chita': 9,
@@ -51,6 +54,23 @@ def local_clock(tz_name, tz_hours):
     hours = tz_hours if tz_hours is not None else TZ.get(tz_name, 3)
     shift = dt.timedelta(hours=hours)
     return (lambda t: t + shift), f'{tz_name or "без пояса"}, UTC+{hours}'
+
+
+KIND_NAME = {'cash': 'Наличные', 'noncash': 'Безналичные', 'other': 'Вид не определён'}
+VISIT_NAME = {1: 'Приём начат', 2: 'Пациент ожидает', 4: 'Отменена / не состоялась', 5: 'Запланирована',
+              6: 'Подтверждена', 7: 'Приём окончен'}
+
+
+def kind_1c(raw):
+    """Вид оплаты из 1С: Наличные/Наличными — наличные; Безналичные, ПлатежнаяКарта — безнал."""
+    t = raw.strip().lower() if isinstance(raw, str) else ''
+    if t.startswith('налич'):
+        return 'cash'
+    return 'noncash' if t else 'other'
+
+
+def kind_db(payment_type):
+    return {1: 'cash', 2: 'noncash'}.get(payment_type, 'other')
 
 
 def lst(v):
@@ -111,6 +131,53 @@ class Entity:
 
     def bad(self, kind, example):
         self.problems[kind].append(example)
+
+
+def appointment_metrics(expected, db_apps, chairs, inv_doc, pu, to_local):
+    """Записи «на своих местах»: по месяцам, статусам, врачам, креслам и пересечениям. Пары «в 1С / в базе»."""
+    exp_month, exp_status, exp_doc = collections.Counter(), collections.Counter(), collections.Counter()
+    for k in expected:  # дубли самой 1С уже слиты: ключ = одна запись
+        exp_month[k[2].strftime('%Y-%m')] += 1
+        exp_status[k[4]] += 1
+        exp_doc[k[1]] += 1
+    got_month, got_status, got_doc = collections.Counter(), collections.Counter(), collections.Counter()
+    chair_by_id = {c['id']: c for c in chairs}
+    no_chair = inactive_chair = 0
+    by_chair = collections.defaultdict(list)
+    for a in db_apps:
+        b = to_local(dt.datetime.strptime(a['time_begin'][:19], '%Y-%m-%d %H:%M:%S'))
+        got_month[b.strftime('%Y-%m')] += 1
+        got_status[a['visit_id']] += 1
+        got_doc[inv_doc.get(a['doctor_id'])] += 1
+        if a.get('active') in (0, '0', False):
+            continue  # отменённые кресло не занимают
+        c = chair_by_id.get(a.get('chair_id'))
+        if not c:
+            no_chair += 1
+        elif c.get('active') in (0, '0', False):
+            inactive_chair += 1
+        by_chair[a.get('chair_id')].append((a['time_begin'], a['time_end']))
+    overlaps = 0
+    for rows in by_chair.values():
+        rows.sort()
+        end = ''
+        for b, e in rows:
+            if b < end:
+                overlaps += 1
+            end = max(end, e)
+
+    def pairs(exp, got, names=None):
+        keys = sorted(set(exp) | set(got), key=str)
+        return [{'key': str(k), 'name': (names or {}).get(k, str(k)), 'in_1c': exp.get(k, 0), 'in_db': got.get(k, 0)} for k in keys]
+    doc_names = {k: ' '.join(x for x in (s(pu.get(k, {}).get('last_name')), s(pu.get(k, {}).get('first_name'))) if x) or str(k)
+                 for k in set(exp_doc) | set(got_doc)}
+    months, statuses, doctors = pairs(exp_month, got_month), pairs(exp_status, got_status, VISIT_NAME), pairs(exp_doc, got_doc, doc_names)
+    bad = lambda rows: sum(1 for m in rows if m['in_1c'] != m['in_db'])
+    return {'total': [len(expected), len(db_apps)], 'by_month': months, 'by_status': statuses,
+            'by_doctor': sorted(doctors, key=lambda d: -d['in_1c']),
+            'months_mismatch': bad(months), 'status_mismatch': bad(statuses), 'doctors_mismatch': bad(doctors),
+            'active_without_chair': no_chair, 'in_inactive_chair': inactive_chair, 'chair_overlaps': overlaps,
+            'chairs_used': len(by_chair)}
 
 
 def reconcile(work, dbdir, tz_hours=None, tz_name=None):
@@ -251,7 +318,9 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
     ents.append(e)
 
     # ---------- счета
-    inv = {r['import_id']: r for r in db(dbdir, 'invoice')}
+    # в базе есть и счета, заведённые не импортом (демо-данные образца тенанта, import_id — короткие числа);
+    # считаем только созданные импортом: их import_id — ссылка объекта 1С (GUID)
+    inv = {r['import_id']: r for r in db(dbdir, 'invoice') if GUID.match(s(r.get('import_id')))}
     docs_src = src.load('DocumentObject.ОказаниеУслуг') if stom else src.load('DocumentObject.Прием')
     e = Entity('Счета')
     sales = []
@@ -281,11 +350,14 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
     if stom:
         for x in sales:
             for o in lst(x.get('v8_Оплата')):
-                exp_pay[(x['v8_Клиент'], round(f(o.get('v8_Сумма')), 2))] += 1
+                exp_pay[(x['v8_Клиент'], round(f(o.get('v8_Сумма')), 2), kind_1c(o.get('v8_ВидОплаты')))] += 1
         for name in ('DocumentObject.ПриходныйКассовыйОрдер', 'DocumentObject.ОплатаПлатежнойКартой'):
             for x in src.load(name) or []:
                 if x.get('v8_Posted') == 'true' and x.get('v8_DeletionMark') != 'true' and x.get('v8_Клиент') not in deleted:
-                    exp_pay[(x['v8_Клиент'], round(f(x.get('v8_СуммаДокумента')), 2))] += 1
+                    # кассовый ордер — наличные, кроме начислений ДМС (аванс страховой, безнал); карта — всегда безнал
+                    dms = name.endswith('ПриходныйКассовыйОрдер') and 'ДМС' in s(x.get('v8_Комментарий'))
+                    kind = 'noncash' if dms or name.endswith('ОплатаПлатежнойКартой') else 'cash'
+                    exp_pay[(x['v8_Клиент'], round(f(x.get('v8_СуммаДокумента')), 2), kind)] += 1
     else:
         for x in src.load('DocumentObject.ПоступлениеДенежныхСредств') or []:
             if x.get('v8_Posted') != 'true' or x.get('v8_ВидОперации') == 'ПоступлениеРозничнойВыручкиИзОперационнойКассы':
@@ -293,26 +365,105 @@ def reconcile(work, dbdir, tz_hours=None, tz_name=None):
             if x.get('v8_Контрагент') in deleted or x.get('v8_Контрагент') not in pat_id:
                 continue
             for r in lst(x.get('v8_РасшифровкаПлатежа')):
-                exp_pay[(x['v8_Контрагент'], round(f(r.get('v8_Сумма')), 2))] += 1
+                exp_pay[(x['v8_Контрагент'], round(f(r.get('v8_Сумма')), 2), kind_1c(x.get('v8_ТипДенежныхСредств')))] += 1
     got_pay = collections.Counter()
     for m in db(dbdir, 'money'):
         if m.get('money_operation_type') in ('invoice_paid', 'prepayment'):
-            got_pay[(inv_pat.get(m['patient_id']), round(f(m.get('money')), 2))] += 1
+            got_pay[(inv_pat.get(m['patient_id']), round(f(m.get('money')), 2), kind_db(m.get('payment_type')))] += 1
     e = Entity('Оплаты')
     e.expected = sum(exp_pay.values())
     e.loaded = sum(got_pay.values())
     e.matched = sum((exp_pay & got_pay).values())
     miss = exp_pay - got_pay
     for k, n in list(miss.items())[:20]:
-        e.bad('нет в базе', (k[1], n))
+        e.bad('нет в базе или другой вид оплаты', (k[1], KIND_NAME[k[2]], n))
     if sum((got_pay - exp_pay).values()):
         e.bad('лишние в базе', sum((got_pay - exp_pay).values()))
     ents.append(e)
     pay_src = sum(k[1] * n for k, n in exp_pay.items())
     pay_db = sum(k[1] * n for k, n in got_pay.items())
-    return ents, {'config': 'stom' if stom else 'unf', 'tz': tz_label,
+    metrics = {}
+    # --- метрики: пациенты
+    with_phone_1c = 0
+    for k in clients:
+        if k.get('v8_IsFolder') == 'true' or k.get('v8_DeletionMark') == 'true' or (not stom and k.get('v8_ТипКонтрагента') not in (None, 'Клиенты')):
+            continue
+        with_phone_1c += any(c.get('v8_Тип') == 'Телефон' and digits(c.get('v8_НомерТелефона')) for c in lst(k.get('v8_КонтактнаяИнформация')))
+    with_phone_db = sum(1 for r in pu.values() if r['import_id'] in pat and digits(r.get('phone')))
+    ent_p = ents[0]
+    app_rows = db(dbdir, 'appointments')
+    metrics['patients'] = {
+        'total': [ent_p.expected, ent_p.loaded],
+        'with_phone': [with_phone_1c, with_phone_db],
+        'with_appointments': [len({k[0] for k in expected}), len({a['patient_id'] for a in app_rows})],
+        'with_invoices': [len({x.get('v8_Клиент') or x.get('v8_Контрагент') for x in sales}), len({r['patient_id'] for r in inv.values()})]}
+    # --- метрики: счета и оплаты по видам
+    metrics['invoices'] = {'count': [len(sales), len(inv)], 'sum': [round(sum_src, 2), round(sum_db, 2)]}
+    pay = {}
+    for kind in ('cash', 'noncash', 'other'):
+        pay[kind] = {'count': [sum(n for k, n in exp_pay.items() if k[2] == kind), sum(n for k, n in got_pay.items() if k[2] == kind)],
+                     'sum': [round(sum(k[1] * n for k, n in exp_pay.items() if k[2] == kind), 2),
+                             round(sum(k[1] * n for k, n in got_pay.items() if k[2] == kind), 2)]}
+    pay['total'] = {'count': [sum(exp_pay.values()), sum(got_pay.values())], 'sum': [round(pay_src, 2), round(pay_db, 2)]}
+    metrics['payments'] = pay
+    metrics['appointments'] = appointment_metrics(expected, app_rows, db(dbdir, 'chairs'), inv_doc, pu, to_local)
+    return ents, {'config': 'stom' if stom else 'unf', 'tz': tz_label, 'metrics': metrics,
                   'invoices_sum_1c': round(sum_src, 2), 'invoices_sum_db': round(sum_db, 2),
                   'payments_sum_1c': round(pay_src, 2), 'payments_sum_db': round(pay_db, 2)}
+
+
+def num(n):
+    return f'{n:,}'.replace(',', ' ')
+
+
+def rub(x):
+    return f'{x:,.2f}'.replace(',', ' ')
+
+
+def mark(a, b):
+    return '✔' if a == b else '✘'
+
+
+def metrics_lines(m, full=False):
+    """Раздел «Метрики» для отчётов: markdown-строки. full=True — ещё месяцы и врачи."""
+    if not m:
+        return []
+    p, inv, pay, ap = m['patients'], m['invoices'], m['payments'], m['appointments']
+    out = ['', '## Метрики', '', '### Пациенты', '', '| | В 1С | В базе | |', '| --- | --- | --- | --- |']
+    for label, key in (('Пациентов всего', 'total'), ('с телефоном', 'with_phone'), ('с записями', 'with_appointments'), ('со счетами', 'with_invoices')):
+        a, b = p[key]
+        out.append(f'| {label} | {num(a)} | {num(b)} | {mark(a, b)} |')
+    out += ['', '### Счета и оплаты', '', '| | Штук 1С | Штук база | Сумма 1С, ₽ | Сумма база, ₽ | |', '| --- | --- | --- | --- | --- | --- |']
+    out.append(f"| Счета | {num(inv['count'][0])} | {num(inv['count'][1])} | {rub(inv['sum'][0])} | {rub(inv['sum'][1])} | {mark(inv['sum'][0], inv['sum'][1]) if inv['count'][0] == inv['count'][1] else '✘'} |")
+    for kind in ('cash', 'noncash', 'other'):
+        v = pay[kind]
+        if kind == 'other' and not any(v['count']):
+            continue
+        ok = mark(v['count'][0], v['count'][1]) == '✔' and mark(v['sum'][0], v['sum'][1]) == '✔'
+        out.append(f"| Оплаты: {KIND_NAME[kind].lower()} | {num(v['count'][0])} | {num(v['count'][1])} | {rub(v['sum'][0])} | {rub(v['sum'][1])} | {'✔' if ok else '✘'} |")
+    t = pay['total']
+    ok = t['count'][0] == t['count'][1] and t['sum'][0] == t['sum'][1]
+    out.append(f"| **Оплаты всего** | {num(t['count'][0])} | {num(t['count'][1])} | {rub(t['sum'][0])} | {rub(t['sum'][1])} | {'✔' if ok else '✘'} |")
+    debt = inv['sum'][0] - t['sum'][0]
+    out.append('')
+    out.append(f"Не оплачено по счетам (счета минус оплаты в 1С): {rub(debt)} ₽" + (' — переплата или авансы.' if debt < 0 else '.'))
+    a, b = ap['total']
+    out += ['', '### Записи: все ли на своих местах', '', '| | |', '| --- | --- |',
+            f'| Записей в 1С (уникальных) / в базе | {num(a)} / {num(b)} {mark(a, b)} |',
+            f"| Месяцев с расхождением по количеству | {ap['months_mismatch']} {'✔' if not ap['months_mismatch'] else '✘'} |",
+            f"| Статусов с расхождением по количеству | {ap['status_mismatch']} {'✔' if not ap['status_mismatch'] else '✘'} |",
+            f"| Врачей с расхождением по количеству | {ap['doctors_mismatch']} {'✔' if not ap['doctors_mismatch'] else '✘'} |",
+            f"| Активных записей без кресла | {ap['active_without_chair']} {'✔' if not ap['active_without_chair'] else '✘'} |",
+            f"| Записей в выключенном кресле | {ap['in_inactive_chair']} {'✔' if not ap['in_inactive_chair'] else '✘'} |",
+            f"| Пересечений во времени в одном кресле | {ap['chair_overlaps']} ({ap['chairs_used']} кресел занято) |"]
+    out += ['', 'По статусам:', '', '| Статус | В 1С | В базе | |', '| --- | --- | --- | --- |']
+    out += [f"| {r['name']} | {num(r['in_1c'])} | {num(r['in_db'])} | {mark(r['in_1c'], r['in_db'])} |" for r in ap['by_status']]
+    out += ['', 'По месяцам:', '', '| Месяц | В 1С | В базе | |', '| --- | --- | --- | --- |']
+    out += [f"| {r['name']} | {num(r['in_1c'])} | {num(r['in_db'])} | {mark(r['in_1c'], r['in_db'])} |" for r in ap['by_month']]
+    if full:
+        out += ['', 'По врачам:', '', '| Врач | В 1С | В базе | |', '| --- | --- | --- | --- |']
+        out += [f"| {r['name']} | {num(r['in_1c'])} | {num(r['in_db'])} | {mark(r['in_1c'], r['in_db'])} |" for r in ap['by_doctor']]
+    return out + ['']
 
 
 def render(ents, totals):
@@ -329,6 +480,7 @@ def render(ents, totals):
             f"| Сумма счетов (₽) | {totals['invoices_sum_1c']:,.2f} | {totals['invoices_sum_db']:,.2f} |".replace(',', ' '),
             f"| Сумма оплат (₽) | {totals['payments_sum_1c']:,.2f} | {totals['payments_sum_db']:,.2f} |".replace(',', ' '),
             '', f"Конфигурация: {totals['config']}, часовой пояс филиала: {totals['tz']}.", '']
+    out += metrics_lines(totals.get('metrics'), full=True)
     probs = [(e, k, v) for e in ents for k, v in e.problems.items()]
     if probs:
         out.append('## Расхождения')

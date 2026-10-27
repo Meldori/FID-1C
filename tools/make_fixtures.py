@@ -129,5 +129,6 @@ jw(dbd, 'appointments', [{'patient_id': 10 + i, 'doctor_id': 5, 'time_begin': f'
                           'visit_id': 7, 'active': 1, 'chair_id': 1} for i in range(2)])
 # подложено: сумма второго счёта 1 800 вместо 2 000
 jw(dbd, 'invoice', [{'id': 1 + i, 'import_id': ref(700 + i), 'patient_id': 10 + i, 'price': '1800.00' if i == 1 else '2000.00'} for i in range(3)])
+jw(dbd, 'chairs', [{'id': 1, 'name': 'Кресло 1', 'branch_id': 1, 'active': 1}])
 jw(dbd, 'money', [{'patient_id': 10 + i, 'money': '2000.00', 'money_operation_type': 'invoice_paid', 'payment_type': 1, 'invoice_id': 1 + i} for i in range(3)])
 print('fixtures written to', os.path.abspath(ROOT))
