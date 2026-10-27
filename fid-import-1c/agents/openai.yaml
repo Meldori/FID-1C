@@ -1,0 +1,7 @@
+# Настройки навыка для ChatGPT (десктоп-приложение) и Codex. Claude этот файл не читает и он ему не мешает.
+interface:
+  display_name: "Импорт 1С в Future IT Dent"
+  short_description: "Проверка выгрузки 1С, загрузка в FID и сверка «совпало N/M»"
+  default_prompt: "Проверь выгрузку 1С и скажи, можно ли её загружать в Future IT Dent"
+policy:
+  allow_implicit_invocation: true

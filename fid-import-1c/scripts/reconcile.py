@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Итоговая сверка импорта 1С → Future IT Dent: «совпало N из M» по каждой сущности и общий счёт.
 
-    python reconcile.py --work <папка с V8Exch_Data> --db <папка export_tenant.php> --out <report.md>
-                        [--tz-hours 5] [--json report.json]
+    python reconcile.py --work <папка с V8Exch_Data> --db <папка экспорта> --out <report.md>
+                        [--tz Europe/Samara | --tz-hours 4] [--json report.json]
 
 --work  рабочая папка выгрузки (та, что передавалась get_from_1c; внутри V8Exch_Data/)
---db    папка, куда export_tenant.php выгрузил загруженное
---tz-hours  смещение часового пояса филиала от UTC; по умолчанию берётся из branches.time_zone
+--db    папка, куда `fid_bridge.php export` выгрузил загруженное
+--tz    часовой пояс филиала; по умолчанию берётся из branches.time_zone. Если в Python есть база
+        поясов (zoneinfo + tzdata), учитываются исторические смены поясов, иначе — постоянный сдвиг
+--tz-hours  постоянный сдвиг от UTC вместо пояса
 
 Что считается «совпало»:
   пациенты     — есть в базе, ФИО (без учёта регистра), дата рождения, телефон и email, если есть в 1С
@@ -34,6 +36,21 @@ TZ = {'Europe/Kaliningrad': 2, 'Europe/Moscow': 3, 'Europe/Samara': 4, 'Europe/U
 VISIT = {'ПриемНачат': 1, 'ПациентВКресле': 1, 'ПациентОжидает': 2, 'Запланировано': 5, 'Запланирована': 5,
          'Подтверждена': 6, 'ПриемОкончен': 7, 'Выполнена': 7, 'Прием': 7,
          'ПриемОтменен': 4, 'ПриемНеСостоялся': 4, 'НеПодтверждена': 4, 'Отменена': 4}
+
+
+def local_clock(tz_name, tz_hours):
+    """Функция UTC → местное время филиала и её описание для отчёта."""
+    if tz_hours is None and tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(tz_name)
+            utc = dt.timezone.utc
+            return (lambda t: t.replace(tzinfo=utc).astimezone(zone).replace(tzinfo=None)), f'{tz_name} (с историей поясов)'
+        except Exception:  # нет zoneinfo/tzdata (часто на Windows) — постоянный сдвиг
+            pass
+    hours = tz_hours if tz_hours is not None else TZ.get(tz_name, 3)
+    shift = dt.timedelta(hours=hours)
+    return (lambda t: t + shift), f'{tz_name or "без пояса"}, UTC+{hours}'
 
 
 def lst(v):
@@ -71,7 +88,8 @@ class Source:
         if not os.path.exists(path):
             return []
         try:
-            d = json.load(open(path, encoding='utf-8'))
+            with open(path, encoding='utf-8') as fh:
+                d = json.load(fh)
         except ValueError:
             return None  # файл битый (например, HTML в полях) — вызывающий решает, что делать
         d = d.get('v8_' + name, d) if isinstance(d, dict) else d
@@ -80,7 +98,10 @@ class Source:
 
 def db(dir_, name):
     path = os.path.join(dir_, name + '.json')
-    return json.load(open(path, encoding='utf-8')) if os.path.exists(path) else []
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding='utf-8') as fh:
+        return json.load(fh)
 
 
 class Entity:
@@ -92,14 +113,16 @@ class Entity:
         self.problems[kind].append(example)
 
 
-def reconcile(work, dbdir, tz_hours):
+def reconcile(work, dbdir, tz_hours=None, tz_name=None):
     src = Source(work)
+    if not os.path.isdir(src.dir):
+        raise SystemExit(f'Нет папки {src.dir}: сначала разберите выгрузку (fid1c.py parse)')
     stom = src.has('CatalogObject.Клиенты') and src.has('DocumentObject.ОказаниеУслуг')
     branches = db(dbdir, 'branches')
-    if tz_hours is None:
+    if not tz_name:
         zones = [b.get('time_zone') for b in branches if b.get('import_id')] or [b.get('time_zone') for b in branches]
-        tz_hours = TZ.get(zones[0] if zones else None, 3)
-    shift = dt.timedelta(hours=tz_hours)
+        tz_name = zones[0] if zones else None
+    to_local, tz_label = local_clock(tz_name, tz_hours)
     ents = []
 
     # ---------- пациенты
@@ -209,8 +232,8 @@ def reconcile(work, dbdir, tz_hours):
     inv_doc = {v: k for k, v in doc_id.items()}
     got = collections.Counter()
     for a in db(dbdir, 'appointments'):
-        b = dt.datetime.strptime(a['time_begin'], '%Y-%m-%d %H:%M:%S') + shift
-        en = dt.datetime.strptime(a['time_end'], '%Y-%m-%d %H:%M:%S') + shift
+        b = to_local(dt.datetime.strptime(a['time_begin'][:19], '%Y-%m-%d %H:%M:%S'))
+        en = to_local(dt.datetime.strptime(a['time_end'][:19], '%Y-%m-%d %H:%M:%S'))
         got[(inv_pat.get(a['patient_id']), inv_doc.get(a['doctor_id']), b, en, a['visit_id'])] += 1
     e = Entity('Записи в календаре')
     e.expected = len(expected)
@@ -287,7 +310,7 @@ def reconcile(work, dbdir, tz_hours):
     ents.append(e)
     pay_src = sum(k[1] * n for k, n in exp_pay.items())
     pay_db = sum(k[1] * n for k, n in got_pay.items())
-    return ents, {'config': 'stom' if stom else 'unf', 'tz_hours': tz_hours,
+    return ents, {'config': 'stom' if stom else 'unf', 'tz': tz_label,
                   'invoices_sum_1c': round(sum_src, 2), 'invoices_sum_db': round(sum_db, 2),
                   'payments_sum_1c': round(pay_src, 2), 'payments_sum_db': round(pay_db, 2)}
 
@@ -305,7 +328,7 @@ def render(ents, totals):
     out += ['', '| Деньги | 1С | База |', '| --- | --- | --- |',
             f"| Сумма счетов (₽) | {totals['invoices_sum_1c']:,.2f} | {totals['invoices_sum_db']:,.2f} |".replace(',', ' '),
             f"| Сумма оплат (₽) | {totals['payments_sum_1c']:,.2f} | {totals['payments_sum_db']:,.2f} |".replace(',', ' '),
-            '', f"Конфигурация: {totals['config']}, часовой пояс филиала: UTC+{totals['tz_hours']}.", '']
+            '', f"Конфигурация: {totals['config']}, часовой пояс филиала: {totals['tz']}.", '']
     probs = [(e, k, v) for e in ents for k, v in e.problems.items()]
     if probs:
         out.append('## Расхождения')
@@ -317,25 +340,42 @@ def render(ents, totals):
     return '\n'.join(out) + '\n', m, n
 
 
-def main():
+def as_json(ents, totals):
+    m = sum(e.matched for e in ents)
+    n = sum(e.expected for e in ents)
+    return {'score': [m, n], 'totals': totals,
+            'entities': [{'name': e.name, 'expected': e.expected, 'loaded': e.loaded, 'matched': e.matched,
+                          'problems': {k: v[:20] for k, v in e.problems.items()}} for e in ents]}
+
+
+def run(work, dbdir, out, json_out=None, tz_hours=None, tz_name=None):
+    """Сверка с записью отчётов. Возвращает (текст, данные)."""
+    ents, totals = reconcile(work, dbdir, tz_hours, tz_name)
+    text, m, n = render(ents, totals)
+    with open(out, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+    data = as_json(ents, totals)
+    if json_out:
+        with open(json_out, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1, default=str)
+    return text, data
+
+
+def main(argv=None):
     # консоль Windows по умолчанию не UTF-8 — без этого русский текст выводится кракозябрами
-    sys.stdout.reconfigure(encoding='utf-8')
-    ap = argparse.ArgumentParser()
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    ap = argparse.ArgumentParser(description='Сверка загруженного в Future IT Dent с выгрузкой 1С')
     ap.add_argument('--work', required=True)
     ap.add_argument('--db', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--json')
+    ap.add_argument('--tz')
     ap.add_argument('--tz-hours', type=int)
-    a = ap.parse_args()
-    ents, totals = reconcile(a.work, a.db, a.tz_hours)
-    text, m, n = render(ents, totals)
-    open(a.out, 'w', encoding='utf-8').write(text)
-    if a.json:
-        json.dump({'score': [m, n], 'totals': totals,
-                   'entities': [{'name': e.name, 'expected': e.expected, 'loaded': e.loaded, 'matched': e.matched,
-                                 'problems': {k: v[:20] for k, v in e.problems.items()}} for e in ents]},
-                  open(a.json, 'w', encoding='utf-8'), ensure_ascii=False, indent=1, default=str)
-    sys.stdout.buffer.write(text.encode('utf-8'))
+    a = ap.parse_args(argv)
+    text, data = run(a.work, a.db, a.out, a.json, a.tz_hours, a.tz)
+    sys.stdout.write(text)
+    m, n = data['score']
     return 0 if m == n else 1
 
 

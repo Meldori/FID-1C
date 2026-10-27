@@ -10,8 +10,9 @@
 На повреждённом файле (второй заголовок <?xml) обзор останавливается на повторе, чтобы не считать копии.
 
 Пишет в out_dir:
-  scan.json    — {"counts": [[тип, количество], ...], "samples": {тип: [2 примера]}}
+  scan.json    — количества, помеченные на удаление, период документов, по 2 примера каждого типа
   summary.md   — конфигурация, ключевые объекты, чего не хватает для импорта
+Только стандартная библиотека Python 3.8+.
 """
 import argparse
 import collections
@@ -23,6 +24,7 @@ import xml.etree.ElementTree as ET
 
 NS = re.compile(r'^\{[^}]*\}')
 OPEN = re.compile(rb'^\t\t<v8:([^\s>/]+)')
+FIELD = re.compile(rb'^\t\t\t<v8:(Date|DeletionMark|Posted)>([^<]*)<')
 WRAP = (b'<r xmlns:v8="http://v8.1c.ru/8.1/data/enterprise/current-config" '
         b'xmlns:xs="http://www.w3.org/2001/XMLSchema" '
         b'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:core="http://v8.1c.ru/data">')
@@ -45,7 +47,10 @@ KEY_OBJECTS = {
     'Оплаты': ['DocumentObject.ПоступлениеДенежныхСредств', 'DocumentObject.ПриходныйКассовыйОрдер',
                'DocumentObject.ОплатаПлатежнойКартой', 'DocumentObject.ОказаниеУслуг'],
 }
+CRITICAL = ('Пациенты', 'Счета (оказание услуг)', 'Записи в календарь')
 FIAS = ['InformationRegisterRecordSet.АдресныеОбъекты', 'InformationRegisterRecordSet.АдминистративнаяИерархия']
+# В УНФ телефоны и email лежат в карточке контрагента, отдельный регистр не нужен
+INLINE_CONTACTS = {'unf': ['Контакты (телефоны, email)']}
 
 
 def todict(e):
@@ -75,8 +80,12 @@ def detect_configuration(counts):
     return 'unknown', 'Конфигурация не распознана — изучить вручную по references/explore.md'
 
 
-def scan(path, stop_at_restart):
+def scan(path, stop_at_restart=True):
+    """Один проход по файлу. Возвращает dict: counts, deleted, posted, dates, samples, order, restarted."""
     counts = collections.Counter()
+    deleted = collections.Counter()
+    posted = collections.Counter()
+    dates = {}
     samples = collections.defaultdict(list)
     order = []
     tag = None
@@ -99,6 +108,17 @@ def scan(path, stop_at_restart):
                     continue
             else:
                 buf.append(line)
+                fm = FIELD.match(line)
+                if fm:
+                    name, value = fm.group(1), fm.group(2).decode('utf-8', 'replace')
+                    if name == b'DeletionMark' and value == 'true':
+                        deleted[tag] += 1
+                    elif name == b'Posted' and value == 'true':
+                        posted[tag] += 1
+                    elif name == b'Date' and tag.startswith('DocumentObject.') and not value.startswith('0001'):
+                        day = value[:10]
+                        lo, hi = dates.get(tag, (day, day))
+                        dates[tag] = (min(lo, day), max(hi, day))
                 if not line.startswith(b'\t\t</v8:'):
                     continue
             if tag not in counts:
@@ -113,63 +133,94 @@ def scan(path, stop_at_restart):
                         pass
             tag = None
             buf = []
-    return counts, samples, order, restarted
+    return {'counts': counts, 'deleted': deleted, 'posted': posted, 'dates': dates,
+            'samples': samples, 'order': order, 'restarted': restarted}
 
 
-def main():
+def analyze(result):
+    """Что из нужного импорту есть, чего нет, и вердикт готовности по составу выгрузки."""
+    counts = result['counts']
+    kind, label = detect_configuration(counts)
+    rows, missing = [], []
+    for what, types in KEY_OBJECTS.items():
+        present = [(t, counts[t], result['deleted'].get(t, 0)) for t in types if counts.get(t)]
+        if what in INLINE_CONTACTS.get(kind, []) and not present:
+            rows.append({'what': what, 'object': 'карточка Контрагенты.КонтактнаяИнформация', 'count': None, 'deleted': 0})
+            continue
+        if present:
+            for t, n, d in present:
+                rows.append({'what': what, 'object': t, 'count': n, 'deleted': d})
+        else:
+            rows.append({'what': what, 'object': None, 'count': 0, 'deleted': 0})
+            missing.append(what)
+    critical = [w for w in missing if w in CRITICAL]
+    if result['restarted'] or critical:
+        level = 'НЕЛЬЗЯ'
+        reason = 'файл повреждён' if result['restarted'] else 'нет: ' + ', '.join(critical)
+    elif missing or kind == 'unknown':
+        level = 'МОЖНО С ОГОВОРКАМИ'
+        reason = 'в программе не будет: ' + ', '.join(missing) if missing else 'конфигурация не распознана, нужна ручная проверка'
+    else:
+        level, reason = 'МОЖНО', 'всё нужное для импорта есть'
+    regs = [t for t in result['order'] if t.startswith(('InformationRegister', 'AccumulationRegister'))]
+    days = [d for d in result['dates'].values()]
+    period = (min(d[0] for d in days), max(d[1] for d in days)) if days else None
+    return {'config': kind, 'config_label': label, 'rows': rows, 'missing': missing, 'critical': critical,
+            'level': level, 'reason': reason, 'period': period,
+            'fias': sum(counts.get(t, 0) for t in FIAS),
+            'only_fias_registers': bool(regs) and set(regs) <= set(FIAS),
+            'total_objects': sum(counts.values()), 'types': len(counts)}
+
+
+def summary_lines(path, result, info):
+    lines = ['# Обзор выгрузки 1С', '', f'Файл: `{path}`', f"Конфигурация: **{info['config_label']}**",
+             f"Готовность: **{info['level']} — {info['reason']}**", '']
+    if info['period']:
+        lines += [f"Период документов: {info['period'][0]} — {info['period'][1]}", '']
+    if result['restarted']:
+        lines += ['**Внимание:** в файле повторный заголовок `<?xml` — выгрузка повреждена (`check_dump.py`); посчитано только до первого повтора.', '']
+    lines += ['| Что нужно импорту | Объект 1С | Количество | Помечено на удаление |', '| --- | --- | --- | --- |']
+    for r in info['rows']:
+        count = 'в карточке' if r['count'] is None else r['count']
+        lines.append(f"| {r['what']} | {'`' + r['object'] + '`' if r['object'] else 'нет'} | {count} | {r['deleted'] or ''} |")
+    lines.append('')
+    if info['fias']:
+        lines.append(f"ФИАС в выгрузке: {info['fias']} записей — для импорта не нужен, при повторной выгрузке исключить.")
+    if info['missing']:
+        lines.append('Не хватает: ' + ', '.join(info['missing']) + '.')
+    if info['only_fias_registers']:
+        lines.append('Из регистров в файле только ФИАС: всё, что шло после него, вероятно, обрезано.')
+    lines += ['', f"Всего объектов: {info['total_objects']}, типов: {info['types']}."]
+    return lines
+
+
+def write_outputs(path, out_dir, result, info):
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, 'scan.json'), 'w', encoding='utf-8') as f:
+        json.dump({'counts': result['counts'].most_common(), 'deleted': dict(result['deleted']),
+                   'posted': dict(result['posted']), 'dates': result['dates'], 'order': result['order'],
+                   'restarted': result['restarted'], 'analysis': info, 'samples': result['samples']},
+                  f, ensure_ascii=False, default=str)
+    text = '\n'.join(summary_lines(path, result, info)) + '\n'
+    with open(os.path.join(out_dir, 'summary.md'), 'w', encoding='utf-8') as f:
+        f.write(text)
+    return text
+
+
+def main(argv=None):
     # консоль Windows по умолчанию не UTF-8 — без этого русский текст выводится кракозябрами
-    sys.stdout.reconfigure(encoding='utf-8')
-    ap = argparse.ArgumentParser()
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    ap = argparse.ArgumentParser(description='Обзор XML-выгрузки 1С')
     ap.add_argument('dump')
     ap.add_argument('out_dir')
     ap.add_argument('--count-copies', action='store_true',
                     help='не останавливаться на повторном заголовке <?xml (по умолчанию повторы не считаются)')
-    args = ap.parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-    counts, samples, order, restarted = scan(args.dump, not args.count_copies)
-
-    with open(os.path.join(args.out_dir, 'scan.json'), 'w', encoding='utf-8') as f:
-        json.dump({'counts': counts.most_common(), 'order': order, 'samples': samples}, f, ensure_ascii=False, default=str)
-
-    kind, label = detect_configuration(counts)
-    lines = ['# Обзор выгрузки 1С', '', f'Файл: `{args.dump}`', f'Конфигурация: **{label}**', '']
-    if restarted:
-        lines += ['**Внимание:** в файле повторный заголовок `<?xml` — выгрузка повреждена (`check_dump.py`); посчитано только до первого повтора.', '']
-    lines += ['| Что нужно импорту | Объект 1С | Количество |', '| --- | --- | --- |']
-    missing = []
-    for what, types in KEY_OBJECTS.items():
-        present = [(t, counts[t]) for t in types if counts.get(t)]
-        if present:
-            for t, n in present:
-                lines.append(f'| {what} | `{t}` | {n} |')
-        else:
-            lines.append(f'| {what} | нет | 0 |')
-            missing.append(what)
-    lines.append('')
-    # Вердикт готовности: без пациентов, счетов или при повреждённом файле грузить нельзя;
-    # без контактов, цен, паспортов или графиков — можно, но клиника получит неполные данные
-    critical = [w for w in missing if w in ('Пациенты', 'Счета (оказание услуг)', 'Записи в календарь')]
-    if restarted or critical:
-        reason = 'файл повреждён' if restarted else 'нет: ' + ', '.join(critical)
-        verdict = f'НЕЛЬЗЯ грузить — {reason}'
-    elif missing:
-        verdict = 'МОЖНО С ОГОВОРКАМИ — в программе не будет: ' + ', '.join(missing)
-    else:
-        verdict = 'МОЖНО грузить — всё нужное для импорта есть'
-    lines.insert(4, f'Готовность: **{verdict}**')
-    lines.insert(5, '')
-    fias = sum(counts.get(t, 0) for t in FIAS)
-    if fias:
-        lines.append(f'ФИАС в выгрузке: {fias} записей — для импорта не нужен, при повторной выгрузке исключить.')
-    if missing:
-        lines.append('Не хватает: ' + ', '.join(missing) + '.')
-    regs = [t for t in order if t.startswith(('InformationRegister', 'AccumulationRegister'))]
-    if regs and set(regs) <= set(FIAS):
-        lines.append('Из регистров в файле только ФИАС: всё, что шло после него, вероятно, обрезано.')
-    lines += ['', f'Всего объектов: {sum(counts.values())}, типов: {len(counts)}.']
-    with open(os.path.join(args.out_dir, 'summary.md'), 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    sys.stdout.buffer.write(('\n'.join(lines) + f'\n\nКонфигурация: {kind}\n').encode('utf-8'))
+    args = ap.parse_args(argv)
+    result = scan(args.dump, not args.count_copies)
+    info = analyze(result)
+    text = write_outputs(args.dump, args.out_dir, result, info)
+    sys.stdout.write(text + f"\nКонфигурация: {info['config']}\n")
     return 0
 
 
